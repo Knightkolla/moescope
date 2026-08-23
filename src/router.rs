@@ -1,3 +1,7 @@
+//partial-selection is a known optimization as we do not need to sort all the tokens
+// we can only sort the k ones but that will be delt in the later phase ig.
+//Could use select_nth_unstable_by
+// for O(E) partial selection if E grows large or this becomes a bottleneck
 pub fn top_k_route(scores :&[f32],k:usize) -> Vec<usize>{
     let mut indexed_scores:Vec<(usize,f32)> = scores
     .iter()
