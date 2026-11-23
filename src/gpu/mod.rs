@@ -7,10 +7,12 @@ pub use raw::cuda_available;
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, DriverError};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError};
 use cudarc::nvrtc::{CompileError, CompileOptions, compile_ptx_with_opts};
 
+use crate::dispatcher::DispatchPlan;
 use crate::router::{GateMode, Route, RouteError, validate_batch};
+use crate::telemetry::{Drained, TelemetryError, TelemetryRecord, check_token_range};
 
 /// Anything that can go wrong on the GPU path.
 #[derive(Debug)]
@@ -25,6 +27,8 @@ pub enum GpuError {
     Route(RouteError),
     /// The request is valid for the CPU router but exceeds a GPU kernel limit.
     Limit(String),
+    /// The batch can't be expressed as telemetry records (id overflow).
+    Telemetry(TelemetryError),
 }
 
 impl std::fmt::Display for GpuError {
@@ -35,6 +39,7 @@ impl std::fmt::Display for GpuError {
             GpuError::Compile(e) => write!(f, "NVRTC compile error: {e:?}"),
             GpuError::Route(e) => write!(f, "{e}"),
             GpuError::Limit(msg) => write!(f, "GPU kernel limit: {msg}"),
+            GpuError::Telemetry(e) => write!(f, "{e}"),
         }
     }
 }
@@ -50,6 +55,12 @@ impl From<DriverError> for GpuError {
 impl From<RouteError> for GpuError {
     fn from(e: RouteError) -> Self {
         GpuError::Route(e)
+    }
+}
+
+impl From<TelemetryError> for GpuError {
+    fn from(e: TelemetryError) -> Self {
+        GpuError::Telemetry(e)
     }
 }
 
@@ -84,6 +95,26 @@ pub fn compile_module(ctx: &Arc<CudaContext>, src: &str) -> Result<Arc<CudaModul
     };
     let ptx = compile_ptx_with_opts(src, opts)?;
     Ok(ctx.load_module(ptx)?)
+}
+
+/// `alloc_zeros`, but never zero bytes (`cuMemAlloc(0)` is an error).
+fn alloc_zeros_nonempty<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    stream: &Arc<CudaStream>,
+    len: usize,
+) -> Result<CudaSlice<T>, GpuError> {
+    Ok(stream.alloc_zeros::<T>(len.max(1))?)
+}
+
+/// Copies the first `len` elements of a device buffer to host.
+fn copy_prefix<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    buf: &CudaSlice<T>,
+    len: usize,
+) -> Result<Vec<T>, GpuError> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(stream.clone_dtoh(&buf.slice(0..len))?)
 }
 
 /// Kernel argument encoding of [`GateMode`] (must match `compute_gates`).
@@ -125,6 +156,7 @@ fn validate_for_gpu(logits: &[f32], num_experts: usize, k: usize) -> Result<Batc
 pub struct GpuRouter {
     stream: Arc<CudaStream>,
     route_fn: CudaFunction,
+    dispatch_log_fn: CudaFunction,
 }
 
 impl GpuRouter {
@@ -132,7 +164,11 @@ impl GpuRouter {
     pub fn new(ordinal: usize) -> Result<Self, GpuError> {
         let ctx = open_context(ordinal)?;
         let module = compile_module(&ctx, &kernels::source())?;
-        Ok(GpuRouter { route_fn: module.load_function(kernels::ROUTE_KERNEL)?, stream: ctx.default_stream() })
+        Ok(GpuRouter {
+            route_fn: module.load_function(kernels::ROUTE_KERNEL)?,
+            dispatch_log_fn: module.load_function(kernels::DISPATCH_LOG_KERNEL)?,
+            stream: ctx.default_stream(),
+        })
     }
 
     /// Routes a `[num_tokens, num_experts]` batch on the GPU and copies the
@@ -147,5 +183,146 @@ impl GpuRouter {
         let mut out = self.stream.alloc_zeros::<Route>(shape.num_tokens as usize * k)?;
         raw::launch_route(&self.stream, &self.route_fn, &logits_dev, shape.num_tokens, shape.num_experts, shape.k, mode_code(mode), &mut out)?;
         Ok(self.stream.clone_dtoh(&out)?)
+    }
+
+    /// Routes, dispatches and logs one MoE layer's batch in a single kernel.
+    ///
+    /// Every (token, expert) decision is appended to `log` *in device
+    /// memory*; nothing is copied back here. Call [`TelemetryBuffer::drain`]
+    /// once at the end of the logging window. The returned [`DeviceDispatch`]
+    /// keeps the routes, the per-expert token groups, and the load histogram
+    /// on the device; copy them back only if you need them.
+    ///
+    /// `layer_id` tags the records; `token_offset` is added to each token
+    /// index so successive batches get distinct `token_id`s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_dispatch_log(
+        &self,
+        logits: &[f32],
+        num_experts: usize,
+        k: usize,
+        mode: GateMode,
+        layer_id: u16,
+        token_offset: u32,
+        log: &mut TelemetryBuffer,
+    ) -> Result<DeviceDispatch, GpuError> {
+        let shape = validate_for_gpu(logits, num_experts, k)?;
+        if num_experts > u16::MAX as usize + 1 {
+            return Err(TelemetryError::ExpertIdOverflow { expert_id: num_experts as u32 - 1 }.into());
+        }
+        check_token_range(token_offset, shape.num_tokens as usize)?;
+
+        let (n, e) = (shape.num_tokens as usize, num_experts);
+        let stream = &self.stream;
+        let mut out = DeviceDispatch {
+            stream: stream.clone(),
+            num_experts: e,
+            num_tokens: n,
+            k,
+            routes: alloc_zeros_nonempty::<Route>(stream, n * k)?,
+            expert_counts: stream.alloc_zeros::<u32>(e)?,
+            gathered: alloc_zeros_nonempty::<u32>(stream, n * e)?,
+        };
+        if n == 0 {
+            return Ok(out);
+        }
+        let logits_dev = stream.clone_htod(logits)?;
+        raw::launch_route_dispatch_log(
+            stream,
+            &self.dispatch_log_fn,
+            raw::DispatchLaunch {
+                logits: &logits_dev,
+                num_tokens: shape.num_tokens,
+                num_experts: shape.num_experts,
+                k: shape.k,
+                mode: mode_code(mode),
+                layer_id: layer_id as u32,
+                token_offset,
+                routes: &mut out.routes,
+                expert_counts: &mut out.expert_counts,
+                gathered: &mut out.gathered,
+                log: &mut log.records,
+                log_counters: &mut log.counters,
+            },
+        )?;
+        Ok(out)
+    }
+}
+
+/// Device-resident result of [`GpuRouter::route_dispatch_log`].
+///
+/// Buffers are allocated with at least one element (the driver rejects
+/// zero-byte allocations), so logical sizes are tracked separately.
+pub struct DeviceDispatch {
+    stream: Arc<CudaStream>,
+    num_experts: usize,
+    num_tokens: usize,
+    k: usize,
+    routes: CudaSlice<Route>,
+    expert_counts: CudaSlice<u32>,
+    gathered: CudaSlice<u32>,
+}
+
+impl DeviceDispatch {
+    /// Copies the expert load histogram (tokens per expert) to host.
+    pub fn expert_load(&self) -> Result<Vec<u32>, GpuError> {
+        Ok(self.stream.clone_dtoh(&self.expert_counts)?)
+    }
+
+    /// Copies routes (`[token * k + j]`) and the dispatch plan to host.
+    pub fn to_host(&self) -> Result<(Vec<Route>, DispatchPlan), GpuError> {
+        let (n, e) = (self.num_tokens, self.num_experts);
+        let routes = copy_prefix(&self.stream, &self.routes, n * self.k)?;
+        let counts = self.stream.clone_dtoh(&self.expert_counts)?;
+        let gathered = copy_prefix(&self.stream, &self.gathered, n * e)?;
+        Ok((routes, DispatchPlan::from_parts(e, n, counts, gathered)))
+    }
+}
+
+/// Fixed-capacity telemetry log in GPU memory.
+///
+/// Kernels append to it with an atomic cursor; when it is full, further
+/// records are counted as dropped instead of written. [`drain`](Self::drain)
+/// is the only host transfer.
+pub struct TelemetryBuffer {
+    stream: Arc<CudaStream>,
+    records: CudaSlice<TelemetryRecord>,
+    /// `[append cursor, dropped]`. The cursor keeps counting past capacity,
+    /// so `min(cursor, capacity)` is the number of valid records.
+    counters: CudaSlice<u64>,
+}
+
+impl TelemetryBuffer {
+    /// Allocates room for `capacity` records (12 bytes each) on `router`'s GPU.
+    pub fn new(router: &GpuRouter, capacity: usize) -> Result<Self, GpuError> {
+        if capacity == 0 {
+            return Err(GpuError::Limit("telemetry capacity must be >= 1".into()));
+        }
+        let stream = router.stream.clone();
+        Ok(TelemetryBuffer {
+            records: stream.alloc_zeros::<TelemetryRecord>(capacity)?,
+            counters: stream.alloc_zeros::<u64>(2)?,
+            stream,
+        })
+    }
+
+    /// Maximum records held between drains.
+    pub fn capacity(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Waits for all logging kernels, copies the valid records and the
+    /// dropped count to host, and resets the log to empty.
+    ///
+    /// Transfers: one 16-byte copy of the counters, then one copy of exactly
+    /// the valid prefix of the record buffer (not the whole capacity).
+    pub fn drain(&mut self) -> Result<Drained, GpuError> {
+        self.stream.synchronize()?;
+        let counters = self.stream.clone_dtoh(&self.counters)?;
+        let (cursor, dropped) = (counters[0], counters[1]);
+        let valid = cursor.min(self.capacity() as u64) as usize;
+        let records = copy_prefix(&self.stream, &self.records, valid)?;
+        self.stream.memset_zeros(&mut self.counters)?;
+        Ok(Drained { records, dropped })
     }
 }
