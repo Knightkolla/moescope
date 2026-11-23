@@ -42,12 +42,12 @@ No host sync per step and no Python lists. Every decision is either logged or co
 
 | | |
 |---|---|
-| 📝 Decisions logged | **1,631,232**, 0 dropped |
-| ✅ Match with model's router | **100.00%** |
+| Decisions logged | **1,631,232**, 0 dropped |
+| Match with model's router | **100.00%** |
 | ⏱️ Logging cost | **+2.8%** forward time |
-| ⚖️ Load imbalance | busiest expert gets **1.8–4.0×** its fair share |
-| 💤 Near-idle experts | **17** |
-| 🎯 Most specialised layer | **14**: code + maths share expert 13 |
+| Load imbalance | busiest expert gets **1.8–4.0×** its fair share |
+| Near-idle experts | **17** |
+| Most specialised layer | **14**: code + maths share expert 13 |
 
 </td></tr>
 </table>
@@ -122,16 +122,16 @@ A toy OLMoE (4 layers, 64 experts, top-8, 2,048 tokens per step) on a T4, loggin
 | strategy | step (ms) | overhead |
 |---|---:|---:|
 | no logging | 23.39 | – |
-| Python lists, `.cpu().tolist()` | 42.84 | 🔴 **+83.2%** |
-| `.cpu()` tensors each step | 24.08 | 🟡 +3.0% |
-| tensors kept on GPU, `torch.cat` at end | 22.43 | 🟢 within noise |
-| **moescope** | **22.70** | 🟢 **within noise** |
+| Python lists, `.cpu().tolist()` | 42.84 | **+83.2%** |
+| `.cpu()` tensors each step | 24.08 | +3.0% |
+| tensors kept on GPU, `torch.cat` at end | 22.43 | within noise |
+| **moescope** | **22.70** | **within noise** |
 
 moescope costs about the same as keeping tensors on the GPU yourself. What it adds is a bounded, pre-allocated buffer, explicit drop counting, a fixed record format and a ready-made analysis report. Reproduce with `bench/bench_hook.py`.
 
 ## What it is / isn't
 
-| ✅ It is | ❌ It isn't |
+| It is | It isn't |
 |---|---|
 | A low-overhead recorder for load imbalance, dead experts and specialisation | A faster MoE router: the model's forward pass is unchanged |
 | GPU kernels tested against a CPU reference (exact ids, gates within 1e-5) | Bit-identical to torch on exact ties (the lower expert index wins) |
