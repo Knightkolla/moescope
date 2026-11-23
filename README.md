@@ -70,7 +70,23 @@ Toy OLMoE (real HF architecture, random weights): 4 layers, 64 experts, k=8, 204
 
 On CPU, moescope **loses**. There is no device sync for it to avoid, and it re-runs routing per token. The CPU backend is a reference and a fallback, not the product.
 
-**T4 GPU:** *not measured yet.* Run `bash scripts/colab.sh` and paste the table it prints (also saved to `bench/results/t4.json`). That comparison is the point of the project: `python-list` and `torch-cpu-copy` force a device→host sync per layer per step, while moescope doesn't. `torch-gpu-list` also avoids syncs and is the honest competitor. Its memory grows without a bound, whereas moescope has a fixed capacity with explicit drop counting.
+**Colab Tesla T4** (torch 2.14.1+cu130, driver CUDA 13.0, fp16 model, moescope CUDA backend, 20 timed steps; produced by `scripts/colab.sh`):
+
+| strategy | step ms (median) | p90 ms | overhead vs none | finalize ms | records |
+|---|---:|---:|---:|---:|---:|
+| none | 23.39 | 28.65 | – | – | 0 |
+| python-list | 42.84 | 66.46 | +19.45 ms (+83.2%) | 446.0 | 1,507,328 |
+| torch-cpu-copy | 24.08 | 25.25 | +0.69 ms (+3.0%) | 38.2 | 1,507,328 |
+| torch-gpu-list | 22.43 | 23.57 | −0.96 ms (−4.1%) | 46.9 | 1,507,328 |
+| moescope | 22.70 | 23.47 | −0.68 ms (−2.9%) | 46.8 | 1,507,328 |
+
+How to read this:
+- Naive per-step Python logging nearly doubles step time and adds a 0.45 s finalize.
+- moescope's overhead is **within run-to-run noise** of no logging at all. The `none` row ran first and has a wide p90, so the small negative numbers mean "no measurable cost", not "faster".
+- moescope is no faster than `torch-gpu-list`, which also avoids per-step syncs. What moescope adds over that is a fixed, pre-allocated buffer with explicit drop counting (the list grows without bound) and a ready-made structured record format.
+- `torch-cpu-copy` costs only about 3% here, because this toy model's per-layer sync is cheap. Expect the gap to grow with deeper models and asynchronous pipelines.
+
+Parity on the same T4: GPU router tests (exact expert ids, gates within 1e-5) pass. Through the zero-copy CUDA path, the HF hook example matches the model's own router on every token, with max gate diff 2.2e-8 (OLMoE) and 1.2e-7 (Mixtral).
 
 ## Design notes
 
