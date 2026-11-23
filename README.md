@@ -9,7 +9,7 @@ moescope logs every routing decision on the GPU, inside a CUDA kernel, and hands
 ![Rust](https://img.shields.io/badge/Rust-core-orange?logo=rust)
 ![CUDA](https://img.shields.io/badge/CUDA-NVRTC-76B900?logo=nvidia)
 ![Python](https://img.shields.io/badge/Python-PyO3-3776AB?logo=python&logoColor=white)
-![Overhead](https://img.shields.io/badge/overhead-%2B2.8%25-brightgreen)
+![Overhead](https://img.shields.io/badge/overhead-%2B1.5%E2%80%932.8%25-brightgreen)
 ![Parity](https://img.shields.io/badge/router%20parity-100%25-brightgreen)
 
 </div>
@@ -35,24 +35,24 @@ No host sync per step and no Python lists. Every decision is either logged or co
 
 ## Results
 
-<table>
-<tr><td>
+Three MoE models from two labs, each hooked on every MoE layer and fed the same code, maths, English and French text on a single Tesla T4:
 
-**Granite-3.1-1B-A400M** · T4 · 24 layers × 32 experts, top-8
+| | Granite-3.1-1B-A400M | Granite-3.1-3B-A800M | OLMoE-1B-7B |
+|---|---:|---:|---:|
+| Lab | IBM | IBM | AllenAI |
+| Layers × experts, top-k | 24 × 32, top-8 | 32 × 40, top-8 | 16 × 64, top-8 |
+| Gate mode | top-k → softmax | top-k → softmax | softmax → top-k |
+| Decisions logged | **1,631,232** | **2,174,976** | **1,017,856** |
+| Dropped | 0 | 0 | 0 |
+| Match with the model's own router | **100.00%** (203,904) | **100.00%** (271,872) | **100.00%** (127,232) |
+| Forward-pass cost of logging | **+2.8%** | **+1.5%** | **+2.8%** |
+| Busiest expert vs fair share | 1.8–4.0× | 2.3–5.0× | 3.1–4.8× |
+| Near-idle experts (<10% of fair share) | 17 of 768 | 64 of 1,280 | 26 of 1,024 |
+| Most domain-specialised layer | 14 | 22 | 15 |
 
-| | |
-|---|---|
-| Decisions logged | **1,631,232**, 0 dropped |
-| Match with model's router | **100.00%** |
-| ⏱️ Logging cost | **+2.8%** forward time |
-| Load imbalance | busiest expert gets **1.8–4.0×** its fair share |
-| Near-idle experts | **17** |
-| Most specialised layer | **14**: code + maths share expert 13 |
+"Match" compares moescope's expert set for every (layer, token) with the experts the model itself picked in the same forward pass. In Granite-1B's most specialised layer, code and maths both lean on expert 13, while prose and French spread across others (figure above).
 
-</td></tr>
-</table>
-
-> These numbers come from ~8.5k tokens of hand-written text. They show what the log can reveal; they are not a study of Granite.
+> Each run uses ~8k tokens of hand-written text. The numbers show what the log can reveal; they are not a study of these models. Granite-1B ran on Colab; Granite-3B and OLMoE on Kaggle (transformers 5.20).
 
 ## Quick start
 
@@ -129,6 +129,28 @@ A toy OLMoE (4 layers, 64 experts, top-8, 2,048 tokens per step) on a T4, loggin
 
 moescope costs about the same as keeping tensors on the GPU yourself. What it adds is a bounded, pre-allocated buffer, explicit drop counting, a fixed record format and a ready-made analysis report. Reproduce with `bench/bench_hook.py`.
 
+## Stress test
+
+`bench/stress_test.py` pushes the logging path far beyond a normal forward pass and checks every result against torch. All 21 checks passed on a T4:
+
+| check | result |
+|---|---|
+| Correctness | 66 (experts, k, mode) combinations, E = 8 to 256, k = 1 to 32: **17.3M tokens**, every expert choice matches torch, worst gate error 2e-6 |
+| Volume | **98.6M decisions (1.18 GB)** in one buffer, 0 dropped, per-expert histogram identical to torch's, drained in 4.8 s |
+| Overflow | 3M decisions into a 1M-record buffer: kept exactly 1,000,000, counted exactly 2,000,000 dropped; buffer reusable after drain; 200 log/drain cycles |
+| Odd inputs | all-equal logits, NaN, ±1e30, k = E, E = 65,536, fp16 / bf16, non-contiguous and 3-D tensors, logits produced on a side CUDA stream |
+
+Throughput of one `route_and_log` call (T4, 1M tokens):
+
+| experts, k | moescope | torch softmax + topk alone |
+|---|---:|---:|
+| 8, top-2 | **0.67 ms** (3.2 G decisions/s) | 18.8 ms |
+| 32, top-8 | **16.2 ms** | 19.2 ms |
+| 64, top-8 | 35.2 ms | 27.4 ms |
+| 128, top-8 | 90.3 ms | 47.3 ms |
+
+The kernel uses one thread per token, so it is fastest with few experts; at 128 experts torch's top-k alone is about 2× faster. In a real forward pass that difference is small: see the +1.5–2.8% above.
+
 ## What it is / isn't
 
 | It is | It isn't |
@@ -165,6 +187,7 @@ cargo test                                # CPU: router, dispatch, telemetry, pr
 cargo test --features cuda-13000          # builds the GPU path (GPU tests skip without a driver)
 python -m pytest -q tests/python          # Python bindings
 bash scripts/colab.sh cuda-13000          # full GPU suite, ends with "ALL PHASES PASSED"
+bash scripts/colab_models.sh              # GPU stress test + routing reports for Granite-3B and OLMoE
 ```
 
 On a GPU machine, set `MOESCOPE_REQUIRE_GPU=1` so a missing driver fails the tests instead of skipping them.
