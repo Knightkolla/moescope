@@ -57,7 +57,11 @@ pub enum RouteError {
     /// The flat logits buffer is not a whole number of `num_experts` rows.
     RaggedLogits { len: usize, num_experts: usize },
     /// A NaN or infinite logit; softmax over it would be meaningless.
-    NonFiniteLogit { token: usize, expert: usize, value: f32 },
+    NonFiniteLogit {
+        token: usize,
+        expert: usize,
+        value: f32,
+    },
 }
 
 impl fmt::Display for RouteError {
@@ -72,7 +76,11 @@ impl fmt::Display for RouteError {
                 f,
                 "logits length {len} is not a multiple of num_experts = {num_experts}"
             ),
-            RouteError::NonFiniteLogit { token, expert, value } => write!(
+            RouteError::NonFiniteLogit {
+                token,
+                expert,
+                value,
+            } => write!(
                 f,
                 "non-finite logit {value} at token {token}, expert {expert}"
             ),
@@ -144,7 +152,11 @@ pub fn check_shape(num_experts: usize, k: usize) -> Result<(), RouteError> {
 /// Rejects NaN / +-inf logits, reporting where the first one is.
 pub fn check_finite(logits: &[f32], token: usize) -> Result<(), RouteError> {
     match logits.iter().position(|x| !x.is_finite()) {
-        Some(expert) => Err(RouteError::NonFiniteLogit { token, expert, value: logits[expert] }),
+        Some(expert) => Err(RouteError::NonFiniteLogit {
+            token,
+            expert,
+            value: logits[expert],
+        }),
         None => Ok(()),
     }
 }
@@ -183,7 +195,10 @@ fn route_one(
     Ok(selected
         .into_iter()
         .zip(gates)
-        .map(|(e, gate)| Route { expert_id: e as u32, gate })
+        .map(|(e, gate)| Route {
+            expert_id: e as u32,
+            gate,
+        })
         .collect())
 }
 
@@ -193,8 +208,11 @@ fn route_one(
 /// same inputs.
 pub fn validate_batch(logits: &[f32], num_experts: usize, k: usize) -> Result<usize, RouteError> {
     check_shape(num_experts, k)?;
-    if logits.len() % num_experts != 0 {
-        return Err(RouteError::RaggedLogits { len: logits.len(), num_experts });
+    if !logits.len().is_multiple_of(num_experts) {
+        return Err(RouteError::RaggedLogits {
+            len: logits.len(),
+            num_experts,
+        });
     }
     for (token, row) in logits.chunks_exact(num_experts).enumerate() {
         check_finite(row, token)?;

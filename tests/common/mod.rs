@@ -15,7 +15,10 @@ pub fn gpu() -> Option<&'static GpuRouter> {
     let required = std::env::var("MOESCOPE_REQUIRE_GPU").is_ok_and(|v| v == "1");
     let router = ROUTER.get_or_init(|| {
         if !cuda_available() {
-            assert!(!required, "MOESCOPE_REQUIRE_GPU=1 but no CUDA driver/NVRTC found");
+            assert!(
+                !required,
+                "MOESCOPE_REQUIRE_GPU=1 but no CUDA driver/NVRTC found"
+            );
             eprintln!("SKIP: no CUDA driver found; GPU test not run");
             return None;
         }

@@ -36,7 +36,9 @@ fn main() -> Result<(), GpuError> {
     unsafe { launch.launch(LaunchConfig::for_num_elems(n)) }?;
 
     let out = stream.clone_dtoh(&out_dev)?;
-    let bad = (0..n as usize).filter(|&i| out[i] != 3.0 * i as f32).count();
+    let bad = (0..n as usize)
+        .filter(|&i| out[i] != 3.0 * i as f32)
+        .count();
     if bad == 0 {
         println!("vector_add OK: {n} elements, out[12345] = {}", out[12345]);
         Ok(())

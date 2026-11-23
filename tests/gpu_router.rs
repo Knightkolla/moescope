@@ -17,14 +17,30 @@ fn assert_matches_cpu(logits: &[f32], num_experts: usize, k: usize, mode: GateMo
     assert_eq!(cpu.len(), gpu.len());
     for (i, (c, g)) in cpu.iter().zip(&gpu).enumerate() {
         let (t, j) = (i / k, i % k);
-        assert_eq!(c.expert_id, g.expert_id, "expert mismatch at token {t}, slot {j} ({mode:?}, E={num_experts}, k={k})");
-        assert!((c.gate - g.gate).abs() <= 1e-5, "gate mismatch at token {t}, slot {j}: cpu {} gpu {}", c.gate, g.gate);
+        assert_eq!(
+            c.expert_id, g.expert_id,
+            "expert mismatch at token {t}, slot {j} ({mode:?}, E={num_experts}, k={k})"
+        );
+        assert!(
+            (c.gate - g.gate).abs() <= 1e-5,
+            "gate mismatch at token {t}, slot {j}: cpu {} gpu {}",
+            c.gate,
+            g.gate
+        );
     }
 }
 
 #[test]
 fn matches_cpu_across_shapes_and_modes() {
-    let shapes = [(1, 1, 1), (7, 8, 2), (300, 8, 2), (513, 64, 8), (5000, 128, 4), (64, 16, 16), (40, 64, MAX_K)];
+    let shapes = [
+        (1, 1, 1),
+        (7, 8, 2),
+        (300, 8, 2),
+        (513, 64, 8),
+        (5000, 128, 4),
+        (64, 16, 16),
+        (40, 64, MAX_K),
+    ];
     for (seed, &(tokens, experts, k)) in shapes.iter().enumerate() {
         let x = logits(tokens, experts, seed as u64);
         for mode in MODES {
@@ -49,10 +65,19 @@ fn rejects_what_cpu_rejects() {
     let mode = GateMode::SoftmaxThenTopK;
     assert!(matches!(
         router.route(&[1.0, 2.0], 2, 3, mode),
-        Err(GpuError::Route(RouteError::KExceedsExperts { k: 3, num_experts: 2 }))
+        Err(GpuError::Route(RouteError::KExceedsExperts {
+            k: 3,
+            num_experts: 2
+        }))
     ));
-    assert!(matches!(router.route(&[1.0, f32::NAN], 2, 1, mode), Err(GpuError::Route(RouteError::NonFiniteLogit { .. }))));
+    assert!(matches!(
+        router.route(&[1.0, f32::NAN], 2, 1, mode),
+        Err(GpuError::Route(RouteError::NonFiniteLogit { .. }))
+    ));
     let wide = vec![0.0; 64];
-    assert!(matches!(router.route(&wide, 64, MAX_K + 1, mode), Err(GpuError::Limit(_))));
+    assert!(matches!(
+        router.route(&wide, 64, MAX_K + 1, mode),
+        Err(GpuError::Limit(_))
+    ));
     assert!(router.route(&[], 4, 2, mode).unwrap().is_empty());
 }

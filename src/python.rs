@@ -22,7 +22,10 @@ enum Backend {
     Cpu(HostTelemetry),
     /// Fused CUDA kernel + device-resident log.
     #[cfg(feature = "cuda")]
-    Gpu { router: GpuRouter, log: TelemetryBuffer },
+    Gpu {
+        router: GpuRouter,
+        log: TelemetryBuffer,
+    },
 }
 
 fn value_err(e: impl std::fmt::Display) -> PyErr {
@@ -32,7 +35,10 @@ fn value_err(e: impl std::fmt::Display) -> PyErr {
 #[cfg(feature = "cuda")]
 fn gpu_err(e: GpuError) -> PyErr {
     match e {
-        GpuError::Route(_) | GpuError::Telemetry(_) | GpuError::Limit(_) | GpuError::ForeignPtr(_) => value_err(e),
+        GpuError::Route(_)
+        | GpuError::Telemetry(_)
+        | GpuError::Limit(_)
+        | GpuError::ForeignPtr(_) => value_err(e),
         _ => PyRuntimeError::new_err(e.to_string()),
     }
 }
@@ -41,7 +47,9 @@ fn parse_mode(mode: &str) -> PyResult<GateMode> {
     match mode {
         "softmax_topk" => Ok(GateMode::SoftmaxThenTopK),
         "topk_softmax" => Ok(GateMode::TopKThenSoftmax),
-        other => Err(value_err(format!("mode must be 'softmax_topk' or 'topk_softmax', got {other:?}"))),
+        other => Err(value_err(format!(
+            "mode must be 'softmax_topk' or 'topk_softmax', got {other:?}"
+        ))),
     }
 }
 
@@ -52,7 +60,10 @@ fn open_backend(device: &str, capacity: usize) -> PyResult<Backend> {
         "cpu" => return cpu(),
         "auto" if !native_cuda_available() => return cpu(),
         "auto" | "cuda" => 0,
-        d => match d.strip_prefix("cuda:").and_then(|n| n.parse::<usize>().ok()) {
+        d => match d
+            .strip_prefix("cuda:")
+            .and_then(|n| n.parse::<usize>().ok())
+        {
             Some(n) => n,
             None => return Err(value_err(format!("unknown device {d:?}"))),
         },
@@ -69,7 +80,9 @@ fn open_gpu(ordinal: usize, capacity: usize) -> PyResult<Backend> {
 
 #[cfg(not(feature = "cuda"))]
 fn open_gpu(_ordinal: usize, _capacity: usize) -> PyResult<Backend> {
-    Err(PyRuntimeError::new_err("moescope was built without the 'cuda' feature"))
+    Err(PyRuntimeError::new_err(
+        "moescope was built without the 'cuda' feature",
+    ))
 }
 
 fn native_cuda_available() -> bool {
@@ -82,7 +95,7 @@ fn native_cuda_available() -> bool {
 /// Serializes records as little-endian bytes matching the numpy dtype
 /// `[('token_id','<u4'),('layer_id','<u2'),('expert_id','<u2'),('gate','<f4')]`.
 fn records_to_bytes(records: &[TelemetryRecord]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(records.len() * std::mem::size_of::<TelemetryRecord>());
+    let mut out = Vec::with_capacity(std::mem::size_of_val(records));
     for r in records {
         out.extend_from_slice(&r.token_id.to_le_bytes());
         out.extend_from_slice(&r.layer_id.to_le_bytes());
@@ -109,7 +122,11 @@ impl Recorder {
         if capacity == 0 {
             return Err(value_err("capacity must be >= 1"));
         }
-        Ok(Recorder { backend: open_backend(device, capacity)?, mode: parse_mode(mode)?, capacity })
+        Ok(Recorder {
+            backend: open_backend(device, capacity)?,
+            mode: parse_mode(mode)?,
+            capacity,
+        })
     }
 
     /// "cpu" or "cuda".
@@ -138,9 +155,19 @@ impl Recorder {
     /// Routes host logits (any C-contiguous float32 buffer of shape
     /// `[num_tokens, num_experts]`) and appends every decision to the log.
     #[pyo3(signature = (logits, k, layer_id, token_offset = 0))]
-    fn route_and_log(&mut self, py: Python<'_>, logits: PyBuffer<f32>, k: usize, layer_id: u16, token_offset: u32) -> PyResult<()> {
+    fn route_and_log(
+        &mut self,
+        py: Python<'_>,
+        logits: PyBuffer<f32>,
+        k: usize,
+        layer_id: u16,
+        token_offset: u32,
+    ) -> PyResult<()> {
         let &[num_tokens, num_experts] = logits.shape() else {
-            return Err(value_err(format!("logits must be 2-D [tokens, experts], got shape {:?}", logits.shape())));
+            return Err(value_err(format!(
+                "logits must be 2-D [tokens, experts], got shape {:?}",
+                logits.shape()
+            )));
         };
         if !logits.is_c_contiguous() {
             return Err(value_err("logits must be C-contiguous"));
@@ -152,7 +179,8 @@ impl Recorder {
         py.detach(move || match backend {
             Backend::Cpu(log) => {
                 let routes = route_batch(&host, num_experts, k, mode).map_err(value_err)?;
-                log.log_routes(&routes, k, layer_id, token_offset).map_err(value_err)
+                log.log_routes(&routes, k, layer_id, token_offset)
+                    .map_err(value_err)
             }
             #[cfg(feature = "cuda")]
             Backend::Gpu { router, log } => router
@@ -181,13 +209,33 @@ impl Recorder {
         let mode = self.mode;
         match &mut self.backend {
             Backend::Cpu(_) => {
-                let _ = (py, ptr, num_tokens, num_experts, k, layer_id, token_offset, mode);
-                Err(PyRuntimeError::new_err("route_and_log_device needs the CUDA backend"))
+                let _ = (
+                    py,
+                    ptr,
+                    num_tokens,
+                    num_experts,
+                    k,
+                    layer_id,
+                    token_offset,
+                    mode,
+                );
+                Err(PyRuntimeError::new_err(
+                    "route_and_log_device needs the CUDA backend",
+                ))
             }
             #[cfg(feature = "cuda")]
             Backend::Gpu { router, log } => py.detach(move || {
                 router
-                    .route_dispatch_log_device(ptr, num_tokens, num_experts, k, mode, layer_id, token_offset, log)
+                    .route_dispatch_log_device(
+                        ptr,
+                        num_tokens,
+                        num_experts,
+                        k,
+                        mode,
+                        layer_id,
+                        token_offset,
+                        log,
+                    )
                     .map(drop)
                     .map_err(gpu_err)
             }),

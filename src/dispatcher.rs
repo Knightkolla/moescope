@@ -33,11 +33,25 @@ pub struct DispatchPlan {
 impl DispatchPlan {
     /// Assembles a plan from raw buffers (used to bring a GPU result back to
     /// host). Panics if the buffer sizes are inconsistent.
-    pub fn from_parts(num_experts: usize, slots_per_expert: usize, expert_counts: Vec<u32>, gathered: Vec<u32>) -> Self {
+    pub fn from_parts(
+        num_experts: usize,
+        slots_per_expert: usize,
+        expert_counts: Vec<u32>,
+        gathered: Vec<u32>,
+    ) -> Self {
         assert_eq!(expert_counts.len(), num_experts);
         assert_eq!(gathered.len(), num_experts * slots_per_expert);
-        assert!(expert_counts.iter().all(|&c| c as usize <= slots_per_expert));
-        DispatchPlan { num_experts, slots_per_expert, expert_counts, gathered }
+        assert!(
+            expert_counts
+                .iter()
+                .all(|&c| c as usize <= slots_per_expert)
+        );
+        DispatchPlan {
+            num_experts,
+            slots_per_expert,
+            expert_counts,
+            gathered,
+        }
     }
 
     /// Number of experts in the layer.
@@ -64,16 +78,27 @@ impl DispatchPlan {
 /// Panics if `routes.len()` is not a multiple of `k` or an expert id is out
 /// of range; both indicate routes that did not come from the router.
 pub fn dispatch(routes: &[Route], k: usize, num_experts: usize) -> DispatchPlan {
-    assert!(k > 0 && routes.len() % k == 0, "routes.len() must be a multiple of k");
+    assert!(
+        k > 0 && routes.len().is_multiple_of(k),
+        "routes.len() must be a multiple of k"
+    );
     let num_tokens = routes.len() / k;
     let mut expert_counts = vec![0u32; num_experts];
     let mut gathered = vec![0u32; num_experts * num_tokens];
     for (a, route) in routes.iter().enumerate() {
         let e = route.expert_id as usize;
-        assert!(e < num_experts, "expert_id {e} out of range for {num_experts} experts");
+        assert!(
+            e < num_experts,
+            "expert_id {e} out of range for {num_experts} experts"
+        );
         let slot = expert_counts[e] as usize;
         gathered[e * num_tokens + slot] = a as u32;
         expert_counts[e] += 1;
     }
-    DispatchPlan { num_experts, slots_per_expert: num_tokens, expert_counts, gathered }
+    DispatchPlan {
+        num_experts,
+        slots_per_expert: num_tokens,
+        expert_counts,
+        gathered,
+    }
 }

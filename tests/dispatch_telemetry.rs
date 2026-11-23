@@ -12,7 +12,14 @@ fn r(expert_id: u32, gate: f32) -> Route {
 #[test]
 fn dispatch_groups_assignments_by_expert_in_token_order() {
     // 3 tokens, k = 2, 4 experts.
-    let routes = [r(1, 0.6), r(3, 0.4), r(1, 0.7), r(0, 0.3), r(2, 0.5), r(1, 0.5)];
+    let routes = [
+        r(1, 0.6),
+        r(3, 0.4),
+        r(1, 0.7),
+        r(0, 0.3),
+        r(2, 0.5),
+        r(1, 0.5),
+    ];
     let plan = dispatch(&routes, 2, 4);
     assert_eq!(plan.expert_load(), &[1, 3, 1, 1]);
     assert_eq!(plan.assignments(0), &[3]);
@@ -25,14 +32,36 @@ fn dispatch_groups_assignments_by_expert_in_token_order() {
 fn records_carry_token_layer_expert_gate() {
     let routes = [r(5, 0.9), r(2, 0.1), r(7, 1.0), r(0, 0.0)];
     let recs = records_for(&routes, 2, 3, 100).unwrap();
-    assert_eq!(recs[0], TelemetryRecord { token_id: 100, layer_id: 3, expert_id: 5, gate: 0.9 });
-    assert_eq!(recs[3], TelemetryRecord { token_id: 101, layer_id: 3, expert_id: 0, gate: 0.0 });
+    assert_eq!(
+        recs[0],
+        TelemetryRecord {
+            token_id: 100,
+            layer_id: 3,
+            expert_id: 5,
+            gate: 0.9
+        }
+    );
+    assert_eq!(
+        recs[3],
+        TelemetryRecord {
+            token_id: 101,
+            layer_id: 3,
+            expert_id: 0,
+            gate: 0.0
+        }
+    );
 }
 
 #[test]
 fn id_overflow_is_reported() {
-    assert_eq!(records_for(&[r(70_000, 1.0)], 1, 0, 0), Err(TelemetryError::ExpertIdOverflow { expert_id: 70_000 }));
-    assert!(matches!(records_for(&[r(0, 1.0), r(0, 1.0)], 1, 0, u32::MAX), Err(TelemetryError::TokenIdOverflow { .. })));
+    assert_eq!(
+        records_for(&[r(70_000, 1.0)], 1, 0, 0),
+        Err(TelemetryError::ExpertIdOverflow { expert_id: 70_000 })
+    );
+    assert!(matches!(
+        records_for(&[r(0, 1.0), r(0, 1.0)], 1, 0, u32::MAX),
+        Err(TelemetryError::TokenIdOverflow { .. })
+    ));
     // The last representable token id is fine.
     assert!(records_for(&[r(0, 1.0)], 1, 0, u32::MAX).is_ok());
 }

@@ -149,14 +149,25 @@ fn validate_for_gpu(logits: &[f32], num_experts: usize, k: usize) -> Result<Batc
 }
 
 /// Shape-only validation, for logits that live on the device.
-fn validate_shape_for_gpu(num_tokens: usize, num_experts: usize, k: usize) -> Result<BatchShape, GpuError> {
+fn validate_shape_for_gpu(
+    num_tokens: usize,
+    num_experts: usize,
+    k: usize,
+) -> Result<BatchShape, GpuError> {
     check_shape(num_experts, k)?;
     if k > kernels::MAX_K {
-        return Err(GpuError::Limit(format!("k = {k} exceeds MAX_K = {}", kernels::MAX_K)));
+        return Err(GpuError::Limit(format!(
+            "k = {k} exceeds MAX_K = {}",
+            kernels::MAX_K
+        )));
     }
     to_u32(num_tokens * k, "num_tokens * k")?;
     to_u32(num_tokens * num_experts, "num_tokens * num_experts")?;
-    Ok(BatchShape { num_tokens: to_u32(num_tokens, "num_tokens")?, num_experts: to_u32(num_experts, "num_experts")?, k: k as u32 })
+    Ok(BatchShape {
+        num_tokens: to_u32(num_tokens, "num_tokens")?,
+        num_experts: to_u32(num_experts, "num_experts")?,
+        k: k as u32,
+    })
 }
 
 /// GPU MoE router: owns the CUDA context, a stream, and the compiled kernels.
@@ -183,14 +194,31 @@ impl GpuRouter {
     /// Routes a `[num_tokens, num_experts]` batch on the GPU and copies the
     /// result back. Same contract and `[token * k + j]` layout as
     /// [`crate::router::route_batch`]; that function is its test oracle.
-    pub fn route(&self, logits: &[f32], num_experts: usize, k: usize, mode: GateMode) -> Result<Vec<Route>, GpuError> {
+    pub fn route(
+        &self,
+        logits: &[f32],
+        num_experts: usize,
+        k: usize,
+        mode: GateMode,
+    ) -> Result<Vec<Route>, GpuError> {
         let shape = validate_for_gpu(logits, num_experts, k)?;
         if shape.num_tokens == 0 {
             return Ok(Vec::new());
         }
         let logits_dev = self.stream.clone_htod(logits)?;
-        let mut out = self.stream.alloc_zeros::<Route>(shape.num_tokens as usize * k)?;
-        raw::launch_route(&self.stream, &self.route_fn, &logits_dev, shape.num_tokens, shape.num_experts, shape.k, mode_code(mode), &mut out)?;
+        let mut out = self
+            .stream
+            .alloc_zeros::<Route>(shape.num_tokens as usize * k)?;
+        raw::launch_route(
+            &self.stream,
+            &self.route_fn,
+            &logits_dev,
+            shape.num_tokens,
+            shape.num_experts,
+            shape.k,
+            mode_code(mode),
+            &mut out,
+        )?;
         Ok(self.stream.clone_dtoh(&out)?)
     }
 
@@ -221,7 +249,14 @@ impl GpuRouter {
             return self.empty_dispatch(num_experts);
         }
         let logits_dev = self.stream.clone_htod(logits)?;
-        self.launch_dispatch(raw::LogitsArg::Owned(&logits_dev), shape, mode, layer_id, token_offset, log)
+        self.launch_dispatch(
+            raw::LogitsArg::Owned(&logits_dev),
+            shape,
+            mode,
+            layer_id,
+            token_offset,
+            log,
+        )
     }
 
     /// [`route_dispatch_log`](Self::route_dispatch_log) reading logits
@@ -252,9 +287,17 @@ impl GpuRouter {
         if num_tokens == 0 {
             return self.empty_dispatch(num_experts);
         }
-        let foreign = raw::borrow_foreign_f32(self.stream.context(), logits_ptr, num_tokens * num_experts)?
-            .map_err(GpuError::ForeignPtr)?;
-        self.launch_dispatch(raw::LogitsArg::Foreign(foreign), shape, mode, layer_id, token_offset, log)
+        let foreign =
+            raw::borrow_foreign_f32(self.stream.context(), logits_ptr, num_tokens * num_experts)?
+                .map_err(GpuError::ForeignPtr)?;
+        self.launch_dispatch(
+            raw::LogitsArg::Foreign(foreign),
+            shape,
+            mode,
+            layer_id,
+            token_offset,
+            log,
+        )
     }
 
     /// Result for a zero-token batch: nothing to launch, empty histogram.
@@ -282,9 +325,16 @@ impl GpuRouter {
         token_offset: u32,
         log: &mut TelemetryBuffer,
     ) -> Result<DeviceDispatch, GpuError> {
-        let (n, e, k) = (shape.num_tokens as usize, shape.num_experts as usize, shape.k as usize);
+        let (n, e, k) = (
+            shape.num_tokens as usize,
+            shape.num_experts as usize,
+            shape.k as usize,
+        );
         if e > u16::MAX as usize + 1 {
-            return Err(TelemetryError::ExpertIdOverflow { expert_id: shape.num_experts - 1 }.into());
+            return Err(TelemetryError::ExpertIdOverflow {
+                expert_id: shape.num_experts - 1,
+            }
+            .into());
         }
         check_token_range(token_offset, n)?;
         let stream = &self.stream;

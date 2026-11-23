@@ -17,8 +17,13 @@ pub fn cuda_available() -> bool {
     unsafe { cudarc::driver::sys::is_culib_present() && cudarc::nvrtc::sys::is_culib_present() }
 }
 
-use cudarc::driver::sys::{CUdeviceptr, CUpointer_attribute, cuMemGetAddressRange_v2, cuPointerGetAttribute};
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
+use cudarc::driver::sys::{
+    CUdeviceptr, CUpointer_attribute, cuMemGetAddressRange_v2, cuPointerGetAttribute,
+};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
+    ValidAsZeroBits,
+};
 
 use crate::router::Route;
 use crate::telemetry::TelemetryRecord;
@@ -42,7 +47,11 @@ const BLOCK: u32 = 256;
 
 /// Grid covering `num_tokens` threads, one token each.
 fn per_token_config(num_tokens: u32) -> LaunchConfig {
-    LaunchConfig { grid_dim: (num_tokens.div_ceil(BLOCK), 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 }
+    LaunchConfig {
+        grid_dim: (num_tokens.div_ceil(BLOCK), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }
 
 /// Launches `moe_route` on `stream`.
@@ -50,6 +59,7 @@ fn per_token_config(num_tokens: u32) -> LaunchConfig {
 /// Preconditions (checked by the safe caller in `gpu::mod`, asserted here):
 /// `logits.len() == num_tokens * num_experts`, `out.len() == num_tokens * k`,
 /// `1 <= k <= MAX_K`, `num_tokens > 0`.
+#[allow(clippy::too_many_arguments)] // mirrors the kernel signature
 pub(super) fn launch_route(
     stream: &CudaStream,
     func: &CudaFunction,
@@ -64,7 +74,13 @@ pub(super) fn launch_route(
     assert_eq!(out.len(), num_tokens as usize * k as usize);
     assert!(k >= 1 && k as usize <= super::kernels::MAX_K && num_tokens > 0);
     let mut launch = stream.launch_builder(func);
-    launch.arg(logits).arg(&num_tokens).arg(&num_experts).arg(&k).arg(&mode).arg(out);
+    launch
+        .arg(logits)
+        .arg(&num_tokens)
+        .arg(&num_experts)
+        .arg(&k)
+        .arg(&mode)
+        .arg(out);
     // SAFETY: argument order and types match the kernel signature
     // (const float*, uint, uint, uint, int, RouteEntry*). Thread t reads
     // logits[t*E .. t*E+E) and writes out[t*k .. t*k+k) only for t < num_tokens,
@@ -103,9 +119,15 @@ pub enum ForeignPtrError {
     /// The driver does not know this address as device memory.
     NotDeviceMemory,
     /// The allocation is on a different GPU than the router.
-    WrongDevice { expected: usize, found: i32 },
+    WrongDevice {
+        expected: usize,
+        found: i32,
+    },
     /// `[ptr, ptr + len*4)` runs past the end of the allocation.
-    OutOfRange { needed: usize, available: usize },
+    OutOfRange {
+        needed: usize,
+        available: usize,
+    },
 }
 
 /// Validates `ptr` as `len` f32s of device memory usable from `ctx`.
@@ -118,11 +140,15 @@ pub enum ForeignPtrError {
 /// allocators (torch) carve many tensors out of one segment, so a wrong
 /// `len` can still read a neighbouring tensor's bytes (wrong telemetry) -
 /// but never unmapped or freed memory.
-pub(super) fn borrow_foreign_f32(ctx: &CudaContext, ptr: u64, len: usize) -> Result<Result<ForeignF32, ForeignPtrError>, cudarc::driver::DriverError> {
+pub(super) fn borrow_foreign_f32(
+    ctx: &CudaContext,
+    ptr: u64,
+    len: usize,
+) -> Result<Result<ForeignF32, ForeignPtrError>, cudarc::driver::DriverError> {
     if ptr == 0 {
         return Ok(Err(ForeignPtrError::Null));
     }
-    if ptr % std::mem::align_of::<f32>() as u64 != 0 {
+    if !ptr.is_multiple_of(std::mem::align_of::<f32>() as u64) {
         return Ok(Err(ForeignPtrError::Misaligned));
     }
     ctx.bind_to_thread()?;
@@ -145,9 +171,12 @@ pub(super) fn borrow_foreign_f32(ctx: &CudaContext, ptr: u64, len: usize) -> Res
     };
     rc.result()?;
     if ordinal != ctx.ordinal() as i32 {
-        return Ok(Err(ForeignPtrError::WrongDevice { expected: ctx.ordinal(), found: ordinal }));
+        return Ok(Err(ForeignPtrError::WrongDevice {
+            expected: ctx.ordinal(),
+            found: ordinal,
+        }));
     }
-    let needed = len.checked_mul(4).unwrap_or(usize::MAX);
+    let needed = len.saturating_mul(4);
     let available = (base as usize + size).saturating_sub(ptr as usize);
     if needed > available {
         return Ok(Err(ForeignPtrError::OutOfRange { needed, available }));
@@ -199,7 +228,7 @@ pub(super) fn launch_route_dispatch_log(
     p: DispatchLaunch<'_>,
 ) -> Result<(), cudarc::driver::DriverError> {
     let (n, e, k) = (p.num_tokens as usize, p.num_experts as usize, p.k as usize);
-    assert!(n > 0 && k >= 1 && k <= super::kernels::MAX_K && k <= e);
+    assert!(n > 0 && (1..=super::kernels::MAX_K).contains(&k) && k <= e);
     assert_eq!(p.logits.len(), n * e);
     assert_eq!(p.routes.len(), n * k);
     assert_eq!(p.expert_counts.len(), e);

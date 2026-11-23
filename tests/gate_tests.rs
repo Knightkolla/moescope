@@ -1,6 +1,8 @@
 //! Phase 1: softmax + gate weights for the CPU router.
 
-use moescope::router::{GateMode, Route, RouteError, route_batch, route_token, softmax, top_k_route};
+use moescope::router::{
+    GateMode, Route, RouteError, route_batch, route_token, softmax, top_k_route,
+};
 use proptest::prelude::*;
 
 const MODES: [GateMode; 2] = [GateMode::SoftmaxThenTopK, GateMode::TopKThenSoftmax];
@@ -23,10 +25,19 @@ fn softmax_then_topk_keeps_full_softmax_probs() {
     let logits = [1.0, 3.0, 2.0, 0.0];
     let probs = softmax(&logits);
     let routes = route_token(&logits, 2, GateMode::SoftmaxThenTopK).unwrap();
-    assert_eq!(routes, vec![
-        Route { expert_id: 1, gate: probs[1] },
-        Route { expert_id: 2, gate: probs[2] },
-    ]);
+    assert_eq!(
+        routes,
+        vec![
+            Route {
+                expert_id: 1,
+                gate: probs[1]
+            },
+            Route {
+                expert_id: 2,
+                gate: probs[2]
+            },
+        ]
+    );
 }
 
 #[test]
@@ -59,28 +70,50 @@ fn ties_break_toward_lower_expert_index() {
 fn k_greater_than_num_experts_is_an_error() {
     assert_eq!(
         route_token(&[1.0, 2.0], 3, GateMode::SoftmaxThenTopK),
-        Err(RouteError::KExceedsExperts { k: 3, num_experts: 2 })
+        Err(RouteError::KExceedsExperts {
+            k: 3,
+            num_experts: 2
+        })
     );
     assert_eq!(
         route_batch(&[1.0, 2.0], 2, 3, GateMode::TopKThenSoftmax),
-        Err(RouteError::KExceedsExperts { k: 3, num_experts: 2 })
+        Err(RouteError::KExceedsExperts {
+            k: 3,
+            num_experts: 2
+        })
     );
 }
 
 #[test]
 fn shape_errors() {
-    assert_eq!(route_token(&[1.0], 0, GateMode::SoftmaxThenTopK), Err(RouteError::ZeroK));
-    assert_eq!(route_batch(&[], 0, 1, GateMode::SoftmaxThenTopK), Err(RouteError::NoExperts));
+    assert_eq!(
+        route_token(&[1.0], 0, GateMode::SoftmaxThenTopK),
+        Err(RouteError::ZeroK)
+    );
+    assert_eq!(
+        route_batch(&[], 0, 1, GateMode::SoftmaxThenTopK),
+        Err(RouteError::NoExperts)
+    );
     assert_eq!(
         route_batch(&[1.0, 2.0, 3.0], 2, 1, GateMode::SoftmaxThenTopK),
-        Err(RouteError::RaggedLogits { len: 3, num_experts: 2 })
+        Err(RouteError::RaggedLogits {
+            len: 3,
+            num_experts: 2
+        })
     );
 }
 
 #[test]
 fn nan_logit_is_an_error_not_a_panic() {
     let err = route_batch(&[1.0, 2.0, 0.0, f32::NAN], 2, 1, GateMode::SoftmaxThenTopK).unwrap_err();
-    assert!(matches!(err, RouteError::NonFiniteLogit { token: 1, expert: 1, .. }));
+    assert!(matches!(
+        err,
+        RouteError::NonFiniteLogit {
+            token: 1,
+            expert: 1,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -91,7 +124,11 @@ fn legacy_top_k_does_not_panic_on_nan() {
 /// Strategy: (num_experts, k, flat logits for a few tokens).
 fn batch_strategy() -> impl Strategy<Value = (usize, usize, Vec<f32>)> {
     (1usize..=16, 1usize..=4).prop_flat_map(|(e, tokens)| {
-        (Just(e), 1..=e, prop::collection::vec(-20.0f32..20.0, e * tokens))
+        (
+            Just(e),
+            1..=e,
+            prop::collection::vec(-20.0f32..20.0, e * tokens),
+        )
     })
 }
 
