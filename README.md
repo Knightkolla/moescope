@@ -88,6 +88,20 @@ How to read this:
 
 Parity on the same T4: GPU router tests (exact expert ids, gates within 1e-5) pass. Through the zero-copy CUDA path, the HF hook example matches the model's own router on every token, with max gate diff 2.2e-8 (OLMoE) and 1.2e-7 (Mixtral).
 
+## Real model: Granite-3.1-1B-A400M on a T4
+
+`python examples/analyze_routing.py` hooks all 24 MoE layers of IBM's Granite-3.1-1B-A400M (32 experts, top-8) and feeds it short code, maths, English prose and French passages. Results on a Colab T4:
+
+- **1,631,232 routing decisions** logged (8,496 tokens × 24 layers × top-8), 0 dropped, drained in one call.
+- **100.00% parity**: 203,904 of 203,904 (layer, token) expert sets match the model's own router.
+- **Logging cost: +2.8%** forward time (366.7 → 377.1 ms). An earlier build cost +13.9%: it allocated dispatch buffers on every call and recomputed the router matmul. Logging now uses a telemetry-only kernel (one pointer check plus one launch, no allocations) on the router's own logits.
+- **Load imbalance:** the busiest expert gets 1.8–4.0× its fair share depending on layer. 17 experts receive under 10% of a fair share on this text.
+- **Specialisation:** layer 14 separates domains the most. Code and maths both lean on the same expert there, while prose and French spread across others.
+
+The script saves `routing_report.png`, the raw log (`routing_log.npz`) and `summary.json`. It works with OLMoE and Mixtral too (`--model ...`), and `--toy granitemoe|olmoe|mixtral` runs it offline on a tiny random model.
+
+These findings come from a few thousand tokens of hand-written text. They are a demo of what the log shows, not a study of Granite.
+
 ## Design notes
 
 - **Ties / NaN:** higher logit wins; on an exact tie the lower expert index wins; NaN ranks as -inf. Host APIs reject non-finite logits with an error and never panic. The device-pointer path can't check for NaN.
