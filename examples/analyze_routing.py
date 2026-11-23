@@ -171,39 +171,44 @@ def tokenize(tok, text, vocab_size, device, seq_cap=512):
 
 class RoutingLogger:
     """Hooks every router: logs decisions with moescope and (optionally)
-    keeps the model's own top-k choice for a parity check."""
+    keeps the model's own top-k choice for a parity check.
 
-    def __init__(self, routers, k, check_parity):
-        self.routers, self.k, self.check = routers, k, check_parity
+    When the router returns its logits (transformers >= 5), those are logged
+    directly, so the hook adds no matmul. Otherwise (4.x Linear routers) the
+    logits are recomputed from the router input with the router's own weight,
+    which is the same op and gives bit-identical logits.
+    """
+
+    def __init__(self, routers, k, num_experts, check_parity):
+        self.routers, self.k, self.e, self.check = routers, k, num_experts, check_parity
         self.offset, self.handles, self.reference = 0, [], {}
+        self._inputs = {}
 
     def attach(self):
         for layer_id, r in enumerate(self.routers):
-            self.handles.append(r.register_forward_pre_hook(self._pre(layer_id, r)))
-            if self.check:
-                self.handles.append(r.register_forward_hook(self._post(layer_id)))
+            self.handles.append(r.register_forward_pre_hook(self._pre(layer_id)))
+            self.handles.append(r.register_forward_hook(self._post(layer_id, r)))
 
     def detach(self):
         for h in self.handles:
             h.remove()
-        self.handles = []
+        self.handles, self._inputs = [], {}
 
-    def _pre(self, layer_id, router):
-        w = router_weight(router)
-
+    def _pre(self, layer_id):
         def hook(_mod, inputs):
-            h = inputs[0]
-            # Same op the router itself runs, so the logits are bit-identical.
-            logits = F.linear(h.reshape(-1, h.shape[-1]), w).float()
-            moescope.route_and_log(logits, k=self.k, layer_id=layer_id, token_offset=self.offset)
+            self._inputs[layer_id] = inputs[0]
         return hook
 
-    def _post(self, layer_id):
+    def _post(self, layer_id, router):
         def hook(_mod, _inp, out):
-            # transformers >= 5 routers return (logits, weights, indices).
-            if isinstance(out, tuple) and len(out) >= 3 and out[2].dtype in (torch.int64, torch.int32):
-                idx = out[2].reshape(-1, self.k)
-                self.reference[(layer_id, self.offset)] = idx.cpu()
+            h = self._inputs.pop(layer_id)
+            logits = out[0] if isinstance(out, tuple) else out
+            if not (isinstance(logits, torch.Tensor) and logits.dim() == 2 and logits.shape[-1] == self.e):
+                logits = F.linear(h.reshape(-1, h.shape[-1]), router_weight(router)).float()
+            moescope.route_and_log(logits, k=self.k, layer_id=layer_id, token_offset=self.offset)
+            # transformers >= 5 routers also return the chosen indices.
+            if self.check and isinstance(out, tuple) and len(out) >= 3 and out[2].dtype in (torch.int64, torch.int32):
+                self.reference[(layer_id, self.offset)] = out[2].reshape(-1, self.k).cpu()
         return hook
 
 
@@ -346,7 +351,7 @@ def main():
     print(f"{name}: {num_layers} MoE layers, {num_experts} experts, top-{k}, mode={mode}, moescope backend={rec.backend}")
 
     # 1) Logging cost: same forward passes with and without the moescope hooks.
-    logger = RoutingLogger(routers, k, check_parity=False)
+    logger = RoutingLogger(routers, k, num_experts, check_parity=False)
     time_forward(model, batches, 2, args.device)  # warm-up
     t_plain = time_forward(model, batches, 5, args.device)
     logger.attach()
@@ -355,7 +360,7 @@ def main():
     moescope.drain_with_stats()  # discard timing-run records (may overflow; irrelevant)
 
     # 2) The real logging run (+ parity check against the model's own router).
-    logger = RoutingLogger(routers, k, check_parity=True)
+    logger = RoutingLogger(routers, k, num_experts, check_parity=True)
     logger.attach()
     domain_of_token = []
     with torch.no_grad():

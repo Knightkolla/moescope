@@ -314,8 +314,59 @@ impl GpuRouter {
         })
     }
 
-    /// Shared tail of both entry points: id-range checks, output
-    /// allocation, and the fused kernel launch.
+    /// Telemetry only: like [`route_dispatch_log`](Self::route_dispatch_log)
+    /// but nothing except the log is written. No per-call allocations, one
+    /// kernel launch. Use this when you only want the routing record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_only(
+        &self,
+        logits: &[f32],
+        num_experts: usize,
+        k: usize,
+        mode: GateMode,
+        layer_id: u16,
+        token_offset: u32,
+        log: &mut TelemetryBuffer,
+    ) -> Result<(), GpuError> {
+        let shape = validate_for_gpu(logits, num_experts, k)?;
+        if shape.num_tokens == 0 {
+            return Ok(());
+        }
+        let logits_dev = self.stream.clone_htod(logits)?;
+        let logits = raw::LogitsArg::Owned(&logits_dev);
+        self.launch(logits, shape, mode, layer_id, token_offset, log, None)
+    }
+
+    /// Zero-copy [`log_only`](Self::log_only) for logits already on the GPU
+    /// (same pointer validation and caller requirements as
+    /// [`route_dispatch_log_device`](Self::route_dispatch_log_device)). This
+    /// is what the Python `route_and_log` uses for CUDA tensors: one pointer
+    /// check plus one kernel launch per call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_only_device(
+        &self,
+        logits_ptr: u64,
+        num_tokens: usize,
+        num_experts: usize,
+        k: usize,
+        mode: GateMode,
+        layer_id: u16,
+        token_offset: u32,
+        log: &mut TelemetryBuffer,
+    ) -> Result<(), GpuError> {
+        let shape = validate_shape_for_gpu(num_tokens, num_experts, k)?;
+        if num_tokens == 0 {
+            return Ok(());
+        }
+        let foreign =
+            raw::borrow_foreign_f32(self.stream.context(), logits_ptr, num_tokens * num_experts)?
+                .map_err(GpuError::ForeignPtr)?;
+        let logits = raw::LogitsArg::Foreign(foreign);
+        self.launch(logits, shape, mode, layer_id, token_offset, log, None)
+    }
+
+    /// Shared tail of the dispatch entry points: allocate the per-call
+    /// outputs, then launch.
     fn launch_dispatch(
         &self,
         logits: raw::LogitsArg<'_>,
@@ -330,13 +381,6 @@ impl GpuRouter {
             shape.num_experts as usize,
             shape.k as usize,
         );
-        if e > u16::MAX as usize + 1 {
-            return Err(TelemetryError::ExpertIdOverflow {
-                expert_id: shape.num_experts - 1,
-            }
-            .into());
-        }
-        check_token_range(token_offset, n)?;
         let stream = &self.stream;
         let mut out = DeviceDispatch {
             stream: stream.clone(),
@@ -347,8 +391,45 @@ impl GpuRouter {
             expert_counts: stream.alloc_zeros::<u32>(e)?,
             gathered: alloc_zeros_nonempty::<u32>(stream, n * e)?,
         };
+        let outputs = raw::DispatchOutputs {
+            routes: &mut out.routes,
+            expert_counts: &mut out.expert_counts,
+            gathered: &mut out.gathered,
+        };
+        self.launch(
+            logits,
+            shape,
+            mode,
+            layer_id,
+            token_offset,
+            log,
+            Some(outputs),
+        )?;
+        Ok(out)
+    }
+
+    /// Id-range checks and the fused kernel launch (with or without the
+    /// dispatch outputs).
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        logits: raw::LogitsArg<'_>,
+        shape: BatchShape,
+        mode: GateMode,
+        layer_id: u16,
+        token_offset: u32,
+        log: &mut TelemetryBuffer,
+        dispatch: Option<raw::DispatchOutputs<'_>>,
+    ) -> Result<(), GpuError> {
+        if shape.num_experts as usize > u16::MAX as usize + 1 {
+            return Err(TelemetryError::ExpertIdOverflow {
+                expert_id: shape.num_experts - 1,
+            }
+            .into());
+        }
+        check_token_range(token_offset, shape.num_tokens as usize)?;
         raw::launch_route_dispatch_log(
-            stream,
+            &self.stream,
             &self.dispatch_log_fn,
             raw::DispatchLaunch {
                 logits,
@@ -358,14 +439,12 @@ impl GpuRouter {
                 mode: mode_code(mode),
                 layer_id: layer_id as u32,
                 token_offset,
-                routes: &mut out.routes,
-                expert_counts: &mut out.expert_counts,
-                gathered: &mut out.gathered,
+                dispatch,
                 log: &mut log.records,
                 log_counters: &mut log.counters,
             },
         )?;
-        Ok(out)
+        Ok(())
     }
 }
 

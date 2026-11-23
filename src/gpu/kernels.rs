@@ -113,12 +113,16 @@ extern "C" __global__ void moe_route(const float* logits, unsigned int num_token
 // log_counters[0] (the append cursor, which keeps counting past capacity).
 // Records that land at or beyond `capacity` are not written; they are counted
 // in log_counters[1] (dropped). Nothing is copied to the host here.
+//
+// write_dispatch == 0 is the telemetry-only mode: routes, expert_counts and
+// gathered are never touched (they may be null), so logging costs one launch
+// and no allocations.
 extern "C" __global__ void moe_route_dispatch_log(
         const float* logits, unsigned int num_tokens, unsigned int num_experts,
         unsigned int k, int mode, unsigned int layer_id, unsigned int token_offset,
         RouteEntry* routes, unsigned int* expert_counts, unsigned int* gathered,
         TelemetryRecord* log, unsigned long long capacity,
-        unsigned long long* log_counters) {
+        unsigned long long* log_counters, int write_dispatch) {
     unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= num_tokens) return;
     unsigned int ids[MAX_K];
@@ -128,13 +132,14 @@ extern "C" __global__ void moe_route_dispatch_log(
     unsigned long long base = atomicAdd(&log_counters[0], (unsigned long long)k);
     unsigned int dropped = 0;
     for (unsigned int j = 0; j < k; ++j) {
-        unsigned int a = t * k + j;
         unsigned int e = ids[j];
-        routes[a].expert_id = e;
-        routes[a].gate = gates[j];
-
-        unsigned int slot = atomicAdd(&expert_counts[e], 1u);
-        gathered[e * num_tokens + slot] = a;
+        if (write_dispatch) {
+            unsigned int a = t * k + j;
+            routes[a].expert_id = e;
+            routes[a].gate = gates[j];
+            unsigned int slot = atomicAdd(&expert_counts[e], 1u);
+            gathered[e * num_tokens + slot] = a;
+        }
 
         unsigned long long idx = base + j;
         if (idx < capacity) {

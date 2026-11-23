@@ -130,3 +130,21 @@ fn empty_batch_is_a_no_op() {
     assert!(routes.is_empty() && plan.expert_load().iter().all(|&c| c == 0));
     assert!(log.drain().unwrap().records.is_empty());
 }
+
+#[test]
+fn log_only_records_exactly_what_the_full_path_records() {
+    let Some(router) = gpu() else { return };
+    let (n, e, k) = (1500, 32, 8);
+    let x = logits(n, e, 77);
+    for mode in [GateMode::SoftmaxThenTopK, GateMode::TopKThenSoftmax] {
+        let mut full = TelemetryBuffer::new(router, n * k).unwrap();
+        let mut lean = TelemetryBuffer::new(router, n * k).unwrap();
+        router
+            .route_dispatch_log(&x, e, k, mode, 4, 9, &mut full)
+            .unwrap();
+        router.log_only(&x, e, k, mode, 4, 9, &mut lean).unwrap();
+        let (a, b) = (full.drain().unwrap(), lean.drain().unwrap());
+        assert_eq!((a.dropped, b.dropped), (0, 0));
+        assert_eq!(sorted(a.records), sorted(b.records));
+    }
+}

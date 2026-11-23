@@ -210,11 +210,17 @@ pub(super) struct DispatchLaunch<'a> {
     pub mode: i32,
     pub layer_id: u32,
     pub token_offset: u32,
+    /// `None` = telemetry-only: the kernel skips routes/dispatch entirely.
+    pub dispatch: Option<DispatchOutputs<'a>>,
+    pub log: &'a mut CudaSlice<TelemetryRecord>,
+    pub log_counters: &'a mut CudaSlice<u64>,
+}
+
+/// Per-call outputs of the dispatch half of the kernel.
+pub(super) struct DispatchOutputs<'a> {
     pub routes: &'a mut CudaSlice<Route>,
     pub expert_counts: &'a mut CudaSlice<u32>,
     pub gathered: &'a mut CudaSlice<u32>,
-    pub log: &'a mut CudaSlice<TelemetryRecord>,
-    pub log_counters: &'a mut CudaSlice<u64>,
 }
 
 /// Launches `moe_route_dispatch_log` on `stream`.
@@ -230,9 +236,11 @@ pub(super) fn launch_route_dispatch_log(
     let (n, e, k) = (p.num_tokens as usize, p.num_experts as usize, p.k as usize);
     assert!(n > 0 && (1..=super::kernels::MAX_K).contains(&k) && k <= e);
     assert_eq!(p.logits.len(), n * e);
-    assert_eq!(p.routes.len(), n * k);
-    assert_eq!(p.expert_counts.len(), e);
-    assert_eq!(p.gathered.len(), n * e);
+    if let Some(d) = &p.dispatch {
+        assert_eq!(d.routes.len(), n * k);
+        assert_eq!(d.expert_counts.len(), e);
+        assert_eq!(d.gathered.len(), n * e);
+    }
     assert_eq!(p.log_counters.len(), 2);
     assert!(e <= u16::MAX as usize + 1 && p.layer_id <= u16::MAX as u32);
     assert!(p.token_offset as u64 + n as u64 <= u32::MAX as u64 + 1);
@@ -254,16 +262,24 @@ pub(super) fn launch_route_dispatch_log(
         .arg(&p.k)
         .arg(&p.mode)
         .arg(&p.layer_id)
-        .arg(&p.token_offset)
-        .arg(p.routes)
-        .arg(p.expert_counts)
-        .arg(p.gathered)
+        .arg(&p.token_offset);
+    // Null device pointers for the unused dispatch outputs in telemetry-only mode.
+    let null: CUdeviceptr = 0;
+    let write_dispatch: i32 = p.dispatch.is_some() as i32;
+    match p.dispatch {
+        Some(d) => launch.arg(d.routes).arg(d.expert_counts).arg(d.gathered),
+        None => launch.arg(&null).arg(&null).arg(&null),
+    };
+    launch
         .arg(p.log)
         .arg(&capacity)
-        .arg(p.log_counters);
+        .arg(p.log_counters)
+        .arg(&write_dispatch);
     // SAFETY: argument order and types match the kernel signature
     // (const float*, uint x6 [one is int mode], RouteEntry*, uint*, uint*,
-    // TelemetryRecord*, unsigned long long, unsigned long long*). With the
+    // TelemetryRecord*, unsigned long long, unsigned long long*, int). When
+    // `dispatch` is None the three output pointers are null and
+    // write_dispatch == 0, so the kernel never dereferences them. With the
     // asserts above, for every thread t < n:
     // * logits reads [t*E, t*E+E) and routes writes [t*k, t*k+k): in bounds.
     //   For foreign logits, borrow_foreign_f32 proved the n*E floats lie in

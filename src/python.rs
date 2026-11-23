@@ -184,8 +184,7 @@ impl Recorder {
             }
             #[cfg(feature = "cuda")]
             Backend::Gpu { router, log } => router
-                .route_dispatch_log(&host, num_experts, k, mode, layer_id, token_offset, log)
-                .map(drop)
+                .log_only(&host, num_experts, k, mode, layer_id, token_offset, log)
                 .map_err(gpu_err),
         })
     }
@@ -226,7 +225,7 @@ impl Recorder {
             #[cfg(feature = "cuda")]
             Backend::Gpu { router, log } => py.detach(move || {
                 router
-                    .route_dispatch_log_device(
+                    .log_only_device(
                         ptr,
                         num_tokens,
                         num_experts,
@@ -236,7 +235,6 @@ impl Recorder {
                         token_offset,
                         log,
                     )
-                    .map(drop)
                     .map_err(gpu_err)
             }),
         }
