@@ -104,7 +104,9 @@ def build_model(args):
 
     dtype = torch.float16 if args.device == "cuda" else torch.float32
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype).to(args.device).eval()
+    # device_map loads weights straight onto the GPU: OLMoE-1B-7B is ~14 GB in
+    # fp16, more than a free Colab VM's RAM, but it fits a 16 GB T4.
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, device_map=args.device).eval()
     return model, tok
 
 
