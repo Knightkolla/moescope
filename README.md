@@ -1,48 +1,73 @@
-# moescope
+<div align="center">
 
-**Log every routing decision of a Mixture-of-Experts model on the GPU, then read it all back in one call.**
+# 🔬 moescope
 
-moescope is a small Rust + CUDA library with Python bindings. You attach it to an MoE model's router. A CUDA kernel recomputes each token's top-k experts and gate weights, and appends one 12-byte record per decision, `(token_id, layer_id, expert_id, gate)`, to a fixed-size buffer in GPU memory. Nothing crosses to the host until you call `drain()`, which returns the whole log as a numpy array.
+**See exactly where every token goes inside a Mixture-of-Experts model.**
+
+moescope logs every routing decision on the GPU, inside a CUDA kernel, and hands you the whole log in one call.
+
+![Rust](https://img.shields.io/badge/Rust-core-orange?logo=rust)
+![CUDA](https://img.shields.io/badge/CUDA-NVRTC-76B900?logo=nvidia)
+![Python](https://img.shields.io/badge/Python-PyO3-3776AB?logo=python&logoColor=white)
+![Overhead](https://img.shields.io/badge/overhead-%2B2.8%25-brightgreen)
+![Parity](https://img.shields.io/badge/router%20parity-100%25-brightgreen)
+
+</div>
 
 ![Routing report for Granite-3.1-1B-A400M](docs/granite_routing_report.png)
 
-*Granite-3.1-1B-A400M (24 MoE layers, 32 experts, top-8) on a Colab T4: 1.63M routing decisions over code, maths, English and French text. Top: load per expert and layer. Bottom: per-domain expert usage in the most specialised layer.*
+<p align="center"><sub>IBM Granite-3.1-1B-A400M on a free Colab T4: 1.63M routing decisions across code, maths, English and French.</sub></p>
+
+---
+
+## Why
+
+MoE models send each token to a few of many experts. To find out which experts get overloaded, which sit idle and which ones specialise, you need **every** routing decision, and logging that from Python is slow: a naive `.cpu().tolist()` hook nearly **doubles** step time.
+
+moescope keeps the whole log on the GPU instead:
+
+```
+router logits ──▶ CUDA kernel ──▶ 12-byte records in a GPU buffer ──▶ drain() ──▶ numpy
+                  (top-k + gates)  (token, layer, expert, gate)        (one copy, at the end)
+```
+
+No host sync per step and no Python lists. Every decision is either logged or counted as dropped, so nothing goes missing silently.
 
 ## Results
 
-Measured on a Colab Tesla T4 with `examples/analyze_routing.py`:
+<table>
+<tr><td>
+
+**Granite-3.1-1B-A400M** · T4 · 24 layers × 32 experts, top-8
 
 | | |
 |---|---|
-| Decisions logged | 1,631,232 (8,496 tokens × 24 layers × top-8), 0 dropped |
-| Match with the model's own router | 100.00% (203,904 of 203,904 expert sets) |
-| Forward-pass cost of logging | +2.8% (366.7 → 377.1 ms) |
-| Load imbalance | busiest expert gets 1.8–4.0× its fair share, depending on layer |
-| Near-idle experts | 17 across all layers (under 10% of a fair share) |
-| Most specialised layer | 14: code and maths both lean on expert 13, prose and French use others |
+| 📝 Decisions logged | **1,631,232**, 0 dropped |
+| ✅ Match with model's router | **100.00%** |
+| ⏱️ Logging cost | **+2.8%** forward time |
+| ⚖️ Load imbalance | busiest expert gets **1.8–4.0×** its fair share |
+| 💤 Near-idle experts | **17** |
+| 🎯 Most specialised layer | **14**: code + maths share expert 13 |
 
-These numbers come from a few thousand tokens of hand-written text. They show what the log can reveal; they are not a study of Granite.
+</td></tr>
+</table>
 
-## What it is, and what it isn't
+> These numbers come from ~8.5k tokens of hand-written text. They show what the log can reveal; they are not a study of Granite.
 
-**It is**
-- A low-overhead way to record every routing decision, for spotting load imbalance, dead experts and domain specialisation.
-- A CPU reference router. The CUDA kernels are tested against it: exact expert ids, gates within 1e-5.
-- A fixed-capacity log with explicit drop counting. It never grows without bound and never loses records silently.
-
-**It isn't**
-- A faster MoE router. It recomputes routing next to the model's own router and doesn't change the forward pass.
-- Bit-identical to torch on exact ties: ties go to the lower expert index.
-
-## Install
-
-GPU (Linux + NVIDIA). Pick the `cuda-XXXXX` feature that matches the "CUDA Version" in `nvidia-smi`; supported values are `cuda-13000`, `cuda-12080`, `cuda-12040` and `cuda-auto`:
+## Quick start
 
 ```sh
 pip install maturin
 maturin build --release -F python,pyo3/extension-module,cuda-13000 -o dist
 pip install dist/moescope-*.whl
+
+python examples/analyze_routing.py      # → routing_report.png, routing_log.npz, summary.json
 ```
+
+<details>
+<summary>Other CUDA versions / CPU only</summary>
+
+Choose the feature that matches the "CUDA Version" shown by `nvidia-smi`: `cuda-13000`, `cuda-12080`, `cuda-12040`, or `cuda-auto`.
 
 CPU only (any OS, for trying it out):
 
@@ -50,7 +75,9 @@ CPU only (any OS, for trying it out):
 pip install maturin && maturin develop --release
 ```
 
-Building needs a Rust toolchain. The GPU build needs the NVIDIA driver and NVRTC (part of the CUDA toolkit) at runtime.
+You need a Rust toolchain to build. The GPU build also needs the NVIDIA driver and NVRTC (from the CUDA toolkit).
+
+</details>
 
 ## Usage
 
@@ -62,67 +89,82 @@ moescope.configure(capacity=50_000_000, mode="topk_softmax")  # 12 bytes per dec
 def make_hook(layer_id):
     def hook(_module, _inputs, out):
         logits = out[0] if isinstance(out, tuple) else out
-        moescope.route_and_log(logits, k=8, layer_id=layer_id, token_offset=offset)
+        moescope.route_and_log(logits, k=8, layer_id=layer_id)
     return hook
 
 for i, layer in enumerate(model.model.layers):
     layer.block_sparse_moe.router.register_forward_hook(make_hook(i))  # OLMoE/Mixtral: layer.mlp.gate
 
-# ... run your model as usual ...
+model(**inputs)                     # run as usual
 
-log = moescope.drain()  # numpy structured array: token_id, layer_id, expert_id, gate
+log = moescope.drain()              # structured numpy array
+log["expert_id"], log["gate"]       # fields: token_id, layer_id, expert_id, gate
 ```
 
-- **Modes:** `softmax_topk` (softmax over all experts, then keep the top-k probabilities) for OLMoE and Switch. `topk_softmax` (softmax over the k selected logits) for Mixtral and Granite.
-- **Zero-copy:** a torch CUDA tensor is read in place. Logging is one pointer check plus one kernel launch, with no host sync.
-- **Overflow:** if the buffer fills up, `drain()` warns and `drain_with_stats()` returns the dropped count.
+| | |
+|---|---|
+| **Gate modes** | `softmax_topk` for OLMoE / Switch · `topk_softmax` for Mixtral / Granite |
+| **Zero-copy** | torch CUDA tensors are read in place: one pointer check, one kernel launch |
+| **Overflow** | `drain()` warns; `drain_with_stats()` returns the dropped count |
+| **Token ids** | pass `token_offset=` to keep ids unique across batches |
 
-For a complete report (figure, raw log, `summary.json`):
+Try other models:
 
 ```sh
-python examples/analyze_routing.py                                # Granite-3.1-1B-A400M
 python examples/analyze_routing.py --model allenai/OLMoE-1B-7B-0924
-python examples/analyze_routing.py --toy granitemoe               # tiny offline model
+python examples/analyze_routing.py --toy granitemoe        # tiny offline model, no download
 ```
 
-## Testing
+## Benchmark
 
-```sh
-cargo test                                   # CPU: router, dispatch, telemetry, property tests
-cargo test --features cuda-13000             # also builds the GPU path (GPU tests skip without a driver)
-python -m pytest -q tests/python             # Python bindings
-bash scripts/colab.sh cuda-13000             # everything on a GPU, ending in "ALL PHASES PASSED"
-```
+A toy OLMoE (4 layers, 64 experts, top-8, 2,048 tokens per step) on a T4, logging every decision:
 
-On a GPU machine, set `MOESCOPE_REQUIRE_GPU=1` so a missing driver fails the GPU tests instead of skipping them.
+| strategy | step (ms) | overhead |
+|---|---:|---:|
+| no logging | 23.39 | – |
+| Python lists, `.cpu().tolist()` | 42.84 | 🔴 **+83.2%** |
+| `.cpu()` tensors each step | 24.08 | 🟡 +3.0% |
+| tensors kept on GPU, `torch.cat` at end | 22.43 | 🟢 within noise |
+| **moescope** | **22.70** | 🟢 **within noise** |
 
-## Benchmark: logging strategies
+moescope costs about the same as keeping tensors on the GPU yourself. What it adds is a bounded, pre-allocated buffer, explicit drop counting, a fixed record format and a ready-made analysis report. Reproduce with `bench/bench_hook.py`.
 
-`bench/bench_hook.py` runs a toy OLMoE (4 layers, 64 experts, top-8, 2,048 tokens per step) on a T4 and compares ways of logging every decision:
+## What it is / isn't
 
-| strategy | step ms (median) | overhead vs no logging | finalize ms |
-|---|---:|---:|---:|
-| none | 23.39 | – | – |
-| Python lists, `.cpu().tolist()` per step | 42.84 | +83.2% | 446.0 |
-| `.cpu()` tensors per step | 24.08 | +3.0% | 38.2 |
-| tensors kept on GPU, `torch.cat` at end | 22.43 | within noise | 46.9 |
-| moescope | 22.70 | within noise | 46.8 |
-
-Naive Python logging nearly doubles step time. moescope costs about the same as keeping tensors on the GPU yourself. What it adds over that is a bounded, pre-allocated buffer with explicit drop counting and a ready-made record format.
+| ✅ It is | ❌ It isn't |
+|---|---|
+| A low-overhead recorder for load imbalance, dead experts and specialisation | A faster MoE router: the model's forward pass is unchanged |
+| GPU kernels tested against a CPU reference (exact ids, gates within 1e-5) | Bit-identical to torch on exact ties (the lower expert index wins) |
+| A fixed-capacity log that never grows without bound or silently loses data | |
 
 ## How it works
 
 | path | role |
 |---|---|
-| `src/router.rs` | CPU reference: softmax, top-k, both gate modes, `Result`-based validation (no panics on NaN) |
-| `src/dispatcher.rs` | groups routed tokens per expert and builds the load histogram |
-| `src/telemetry.rs` | the 12-byte `#[repr(C)]` record and a bounded host-side log |
+| `src/router.rs` | CPU reference router: softmax, top-k, both gate modes, NaN-safe validation |
+| `src/dispatcher.rs` | groups tokens per expert, builds the load histogram |
+| `src/telemetry.rs` | the 12-byte `#[repr(C)]` record and a bounded host log |
 | `src/gpu/kernels.rs` | CUDA C compiled at runtime with NVRTC: one thread per token, fused route + dispatch + log |
-| `src/gpu/raw.rs` | the only module allowed `unsafe` (the crate is `#![deny(unsafe_code)]`); every block has a safety comment |
-| `src/python.rs`, `python/moescope/` | PyO3 bindings and the numpy/torch-facing API |
+| `src/gpu/raw.rs` | the **only** module allowed `unsafe`; every block has a safety comment |
+| `src/python.rs`, `python/moescope/` | PyO3 bindings and the numpy / torch API |
 
-Design notes:
-- **Ties and NaN:** a higher logit wins. On an exact tie the lower expert index wins. NaN ranks below every number.
-- **Appending:** each token reserves its k log slots with one `atomicAdd` on a 64-bit cursor. Records past capacity are counted in `dropped`, not written.
-- **Foreign pointers:** a torch tensor's address is checked with `cuMemGetAddressRange` and the device ordinal before the kernel reads it. The check is per driver allocation: torch pools tensors, so a wrong length could read a neighbouring tensor, but never unmapped memory.
+<details>
+<summary>Design notes</summary>
+
+- **Ties and NaN:** the higher logit wins. On an exact tie the lower expert index wins. NaN ranks below every number.
+- **Appending:** each token reserves its k log slots with one 64-bit `atomicAdd`. Records past capacity are counted as `dropped`, not written.
+- **Foreign pointers:** a torch tensor's address is checked with `cuMemGetAddressRange` and its device ordinal is verified before the kernel reads it. The check works per driver allocation: torch pools tensors, so a wrong length could read a neighbouring tensor, but never unmapped memory.
 - **Limits:** `k ≤ 32`, `num_experts ≤ 65,536`, and every flat index must fit in u32.
+
+</details>
+
+## Testing
+
+```sh
+cargo test                                # CPU: router, dispatch, telemetry, property tests
+cargo test --features cuda-13000          # builds the GPU path (GPU tests skip without a driver)
+python -m pytest -q tests/python          # Python bindings
+bash scripts/colab.sh cuda-13000          # full GPU suite, ends with "ALL PHASES PASSED"
+```
+
+On a GPU machine, set `MOESCOPE_REQUIRE_GPU=1` so a missing driver fails the tests instead of skipping them.
