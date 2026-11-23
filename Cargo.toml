@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "MoE routing telemetry: route tokens to experts and log every decision on the GPU"
 
+[lib]
+# rlib for Rust users/tests, cdylib for the Python extension built by maturin.
+crate-type = ["rlib", "cdylib"]
+
 [features]
 default = []
+# Python bindings (built with maturin; see pyproject.toml).
+python = ["dep:pyo3"]
 # GPU path (NVRTC-compiled CUDA kernels via cudarc). On its own this does not
 # pick a CUDA version, so enable it through one of the cuda-XXXXX features below.
 cuda = ["dep:cudarc"]
@@ -18,6 +24,7 @@ cuda-auto = ["cuda", "cudarc/cuda-version-from-build-system"]
 
 [dependencies]
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading"] }
+pyo3 = { version = "0.30", optional = true }
 
 [dev-dependencies]
 proptest = "1"

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "moescope"
+version = "0.1.0"
+description = "MoE routing telemetry: log every router decision on the GPU, drain once"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+examples = ["torch>=2.0", "transformers>=4.40"]
+test = ["pytest>=7"]
+
+[tool.maturin]
+# Rust extension lives at moescope._native; the Python API is in python/moescope.
+module-name = "moescope._native"
+python-source = "python"
+# Add the GPU backend with e.g.: maturin develop --release -F cuda-13000
+features = ["python", "pyo3/extension-module"]

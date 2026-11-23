@@ -17,7 +17,8 @@ pub fn cuda_available() -> bool {
     unsafe { cudarc::driver::sys::is_culib_present() && cudarc::nvrtc::sys::is_culib_present() }
 }
 
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
+use cudarc::driver::sys::{CUdeviceptr, CUpointer_attribute, cuMemGetAddressRange_v2, cuPointerGetAttribute};
+use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
 
 use crate::router::Route;
 use crate::telemetry::TelemetryRecord;
@@ -73,9 +74,107 @@ pub(super) fn launch_route(
     Ok(())
 }
 
+/// A device pointer owned by another library (e.g. a torch CUDA tensor's
+/// `data_ptr()`), checked against the driver to cover `len` f32s inside one
+/// live allocation on our device. Only constructible via [`borrow_foreign_f32`].
+#[derive(Debug, Clone, Copy)]
+pub struct ForeignF32 {
+    ptr: CUdeviceptr,
+    len: usize,
+}
+
+impl ForeignF32 {
+    /// Number of f32 elements covered.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True if the range is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Why a foreign pointer was rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignPtrError {
+    Null,
+    Misaligned,
+    /// The driver does not know this address as device memory.
+    NotDeviceMemory,
+    /// The allocation is on a different GPU than the router.
+    WrongDevice { expected: usize, found: i32 },
+    /// `[ptr, ptr + len*4)` runs past the end of the allocation.
+    OutOfRange { needed: usize, available: usize },
+}
+
+/// Validates `ptr` as `len` f32s of device memory usable from `ctx`.
+///
+/// This is what lets the GPU path take a raw integer from Python without
+/// trusting it: the kernel will only ever read inside an allocation the
+/// driver confirms is live, on our device, and large enough.
+///
+/// Granularity is the *driver allocation*, not the tensor: caching
+/// allocators (torch) carve many tensors out of one segment, so a wrong
+/// `len` can still read a neighbouring tensor's bytes (wrong telemetry) -
+/// but never unmapped or freed memory.
+pub(super) fn borrow_foreign_f32(ctx: &CudaContext, ptr: u64, len: usize) -> Result<Result<ForeignF32, ForeignPtrError>, cudarc::driver::DriverError> {
+    if ptr == 0 {
+        return Ok(Err(ForeignPtrError::Null));
+    }
+    if ptr % std::mem::align_of::<f32>() as u64 != 0 {
+        return Ok(Err(ForeignPtrError::Misaligned));
+    }
+    ctx.bind_to_thread()?;
+    let (mut base, mut size): (CUdeviceptr, usize) = (0, 0);
+    // SAFETY: both out-pointers refer to live, correctly typed locals; the
+    // driver only reads `ptr` as an address (it is never dereferenced on
+    // the host) and returns an error code for unknown addresses.
+    let rc = unsafe { cuMemGetAddressRange_v2(&mut base, &mut size, ptr) };
+    if rc.result().is_err() {
+        return Ok(Err(ForeignPtrError::NotDeviceMemory));
+    }
+    let mut ordinal: i32 = -1;
+    // SAFETY: DEVICE_ORDINAL writes a single `int`, and `ordinal` is an i32 local.
+    let rc = unsafe {
+        cuPointerGetAttribute(
+            (&mut ordinal as *mut i32).cast(),
+            CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+            ptr,
+        )
+    };
+    rc.result()?;
+    if ordinal != ctx.ordinal() as i32 {
+        return Ok(Err(ForeignPtrError::WrongDevice { expected: ctx.ordinal(), found: ordinal }));
+    }
+    let needed = len.checked_mul(4).unwrap_or(usize::MAX);
+    let available = (base as usize + size).saturating_sub(ptr as usize);
+    if needed > available {
+        return Ok(Err(ForeignPtrError::OutOfRange { needed, available }));
+    }
+    Ok(Ok(ForeignF32 { ptr, len }))
+}
+
+/// Where a kernel reads its logits from.
+pub(super) enum LogitsArg<'a> {
+    /// A buffer we allocated and filled from host memory.
+    Owned(&'a CudaSlice<f32>),
+    /// Another library's device memory, validated by [`borrow_foreign_f32`].
+    Foreign(ForeignF32),
+}
+
+impl LogitsArg<'_> {
+    fn len(&self) -> usize {
+        match self {
+            LogitsArg::Owned(s) => s.len(),
+            LogitsArg::Foreign(f) => f.len,
+        }
+    }
+}
+
 /// Device buffers and scalars for one `moe_route_dispatch_log` launch.
 pub(super) struct DispatchLaunch<'a> {
-    pub logits: &'a CudaSlice<f32>,
+    pub logits: LogitsArg<'a>,
     pub num_tokens: u32,
     pub num_experts: u32,
     pub k: u32,
@@ -111,8 +210,16 @@ pub(super) fn launch_route_dispatch_log(
     let capacity = p.log.len() as u64;
 
     let mut launch = stream.launch_builder(func);
+    let foreign_ptr: CUdeviceptr;
+    match &p.logits {
+        LogitsArg::Owned(slice) => launch.arg(*slice),
+        LogitsArg::Foreign(f) => {
+            foreign_ptr = f.ptr;
+            // A `const float*` kernel parameter is just the 8-byte device address.
+            launch.arg(&foreign_ptr)
+        }
+    };
     launch
-        .arg(p.logits)
         .arg(&p.num_tokens)
         .arg(&p.num_experts)
         .arg(&p.k)
@@ -129,7 +236,12 @@ pub(super) fn launch_route_dispatch_log(
     // (const float*, uint x6 [one is int mode], RouteEntry*, uint*, uint*,
     // TelemetryRecord*, unsigned long long, unsigned long long*). With the
     // asserts above, for every thread t < n:
-    // * logits reads [t*E, t*E+E) and routes writes [t*k, t*k+k): in bounds;
+    // * logits reads [t*E, t*E+E) and routes writes [t*k, t*k+k): in bounds.
+    //   For foreign logits, borrow_foreign_f32 proved the n*E floats lie in
+    //   one live allocation on this device. It stays live for the kernel:
+    //   the Python caller holds the tensor across this call, and torch only
+    //   reuses freed blocks in stream order after our launch on the legacy
+    //   default stream (cudaFree itself synchronizes the device);
     // * expert ids are < E, so expert_counts[e] is in bounds, and the slot
     //   returned is < n (counts were zeroed and each token hits e at most
     //   once), so gathered[e*n + slot] < E*n is in bounds;
