@@ -1,0 +1,51 @@
+{
+  "env": {
+    "device": "CPU (macOS-27.0.1-arm64-arm-64bit)",
+    "torch": "2.15.0",
+    "moescope_backend": "cpu",
+    "tokens_per_step": 2048,
+    "records_per_step": 65536,
+    "layers": 4,
+    "experts": 64,
+    "k": 8,
+    "steps": 10
+  },
+  "results": [
+    {
+      "strategy": "none",
+      "step_ms": 86.95485448697582,
+      "p90_ms": 91.82028329232708,
+      "overhead_ms": 0.0,
+      "overhead_pct": 0.0,
+      "finalize_ms": 0.025290995836257935,
+      "records": 0
+    },
+    {
+      "strategy": "python-list",
+      "step_ms": 93.78966700751334,
+      "p90_ms": 135.40829588891938,
+      "overhead_ms": 6.834812520537525,
+      "overhead_pct": 7.860185105089504,
+      "finalize_ms": 65.39875001180917,
+      "records": 851968
+    },
+    {
+      "strategy": "torch-cpu-copy",
+      "step_ms": 87.67908351728693,
+      "p90_ms": 88.67679999675602,
+      "overhead_ms": 0.7242290303111076,
+      "overhead_pct": 0.8328793539865946,
+      "finalize_ms": 2.1915839752182364,
+      "records": 851968
+    },
+    {
+      "strategy": "moescope",
+      "step_ms": 98.49112504161894,
+      "p90_ms": 100.77310454798862,
+      "overhead_ms": 11.536270554643124,
+      "overhead_pct": 13.26696551067317,
+      "finalize_ms": 1.8811669433489442,
+      "records": 851968
+    }
+  ]
+}
