@@ -2,8 +2,26 @@
 name = "moescope"
 version = "0.1.0"
 edition = "2024"
+description = "MoE routing telemetry: route tokens to experts and log every decision on the GPU"
+
+[features]
+default = []
+# GPU path (NVRTC-compiled CUDA kernels via cudarc). On its own this does not
+# pick a CUDA version, so enable it through one of the cuda-XXXXX features below.
+cuda = ["dep:cudarc"]
+# Pick the one matching `nvidia-smi` "CUDA Version" (driver API version).
+cuda-13000 = ["cuda", "cudarc/cuda-13000"]
+cuda-12080 = ["cuda", "cudarc/cuda-12080"]
+cuda-12040 = ["cuda", "cudarc/cuda-12040"]
+# Ask cudarc to detect the version from nvcc / CUDA_PATH at build time.
+cuda-auto = ["cuda", "cudarc/cuda-version-from-build-system"]
 
 [dependencies]
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading"] }
 
 [dev-dependencies]
 proptest = "1"
+
+[[example]]
+name = "vector_add"
+required-features = ["cuda"]
