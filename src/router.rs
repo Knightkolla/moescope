@@ -18,7 +18,11 @@ use std::fmt;
 
 /// One routing decision for one token: send it to `expert_id`, and scale that
 /// expert's output by `gate` when combining.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `#[repr(C)]` so the GPU kernel can write it directly (it is `RouteEntry`
+/// in the CUDA source: `{ unsigned int expert_id; float gate; }`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Route {
     pub expert_id: u32,
     pub gate: f32,
@@ -124,7 +128,7 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
 }
 
 /// Validates the shape parameters shared by every routing entry point.
-fn check_shape(num_experts: usize, k: usize) -> Result<(), RouteError> {
+pub fn check_shape(num_experts: usize, k: usize) -> Result<(), RouteError> {
     if num_experts == 0 {
         return Err(RouteError::NoExperts);
     }
@@ -138,7 +142,7 @@ fn check_shape(num_experts: usize, k: usize) -> Result<(), RouteError> {
 }
 
 /// Rejects NaN / +-inf logits, reporting where the first one is.
-fn check_finite(logits: &[f32], token: usize) -> Result<(), RouteError> {
+pub fn check_finite(logits: &[f32], token: usize) -> Result<(), RouteError> {
     match logits.iter().position(|x| !x.is_finite()) {
         Some(expert) => Err(RouteError::NonFiniteLogit { token, expert, value: logits[expert] }),
         None => Ok(()),
@@ -183,6 +187,21 @@ fn route_one(
         .collect())
 }
 
+/// Validates a flat `[num_tokens, num_experts]` logits batch for top-`k`
+/// routing (shape, `k`, and that every logit is finite) and returns
+/// `num_tokens`. Shared by the CPU and GPU entry points so both reject the
+/// same inputs.
+pub fn validate_batch(logits: &[f32], num_experts: usize, k: usize) -> Result<usize, RouteError> {
+    check_shape(num_experts, k)?;
+    if logits.len() % num_experts != 0 {
+        return Err(RouteError::RaggedLogits { len: logits.len(), num_experts });
+    }
+    for (token, row) in logits.chunks_exact(num_experts).enumerate() {
+        check_finite(row, token)?;
+    }
+    Ok(logits.len() / num_experts)
+}
+
 /// Routes a single token given its logits over all experts.
 pub fn route_token(logits: &[f32], k: usize, mode: GateMode) -> Result<Vec<Route>, RouteError> {
     check_shape(logits.len(), k)?;
@@ -201,11 +220,8 @@ pub fn route_batch(
     k: usize,
     mode: GateMode,
 ) -> Result<Vec<Route>, RouteError> {
-    check_shape(num_experts, k)?;
-    if logits.len() % num_experts != 0 {
-        return Err(RouteError::RaggedLogits { len: logits.len(), num_experts });
-    }
-    let mut routes = Vec::with_capacity(logits.len() / num_experts * k);
+    let num_tokens = validate_batch(logits, num_experts, k)?;
+    let mut routes = Vec::with_capacity(num_tokens * k);
     for (token, row) in logits.chunks_exact(num_experts).enumerate() {
         routes.extend(route_one(row, k, mode, token)?);
     }
