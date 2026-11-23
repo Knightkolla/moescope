@@ -204,13 +204,18 @@ class RoutingLogger:
     def _post(self, layer_id, router):
         def hook(_mod, _inp, out):
             h = self._inputs.pop(layer_id)
-            logits = out[0] if isinstance(out, tuple) else out
-            if not (isinstance(logits, torch.Tensor) and logits.dim() == 2 and logits.shape[-1] == self.e):
+            # Routers differ in what they return and in what order: a bare
+            # logits tensor, (logits, scores, indices) for OLMoE/Mixtral, or
+            # (indices, weights, logits) for Granite. Pick by dtype and shape.
+            outs = out if isinstance(out, tuple) else (out,)
+            tensors = [t for t in outs if isinstance(t, torch.Tensor)]
+            logits = next((t for t in tensors if t.is_floating_point() and t.shape[-1] == self.e), None)
+            indices = next((t for t in tensors if not t.is_floating_point() and t.shape[-1] == self.k), None)
+            if logits is None:  # 4.x Linear routers: recompute with the router's own weight
                 logits = F.linear(h.reshape(-1, h.shape[-1]), router_weight(router)).float()
             moescope.route_and_log(logits, k=self.k, layer_id=layer_id, token_offset=self.offset)
-            # transformers >= 5 routers also return the chosen indices.
-            if self.check and isinstance(out, tuple) and len(out) >= 3 and out[2].dtype in (torch.int64, torch.int32):
-                self.reference[(layer_id, self.offset)] = out[2].reshape(-1, self.k).cpu()
+            if self.check and indices is not None:
+                self.reference[(layer_id, self.offset)] = indices.reshape(-1, self.k).cpu()
         return hook
 
 
