@@ -18,5 +18,6 @@ test = ["pytest>=7"]
 # Rust extension lives at moescope._native; the Python API is in python/moescope.
 module-name = "moescope._native"
 python-source = "python"
-# Add the GPU backend with e.g.: maturin develop --release -F cuda-13000
+# -F on the CLI replaces this list, so for the GPU backend pass all of them:
+#   maturin develop --release -F python,pyo3/extension-module,cuda-13000
 features = ["python", "pyo3/extension-module"]

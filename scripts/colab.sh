@@ -28,7 +28,8 @@ cargo test --release --features "$FEATURE"
 
 echo "== Phase 5: Python bindings"
 pip install -q maturin pytest
-rm -rf dist && maturin build --release -F "$FEATURE" -o dist
+rm -rf dist && # -F replaces pyproject features, so list python + extension-module again.
+maturin build --release -F "python,pyo3/extension-module,$FEATURE" -o dist
 pip install -q --force-reinstall --no-deps dist/moescope-*.whl
 python -c "import moescope; assert moescope.cuda_available(), 'built without CUDA or no driver'; print('moescope CUDA backend OK')"
 MOESCOPE_DEVICE=cuda python -m pytest -q tests/python
