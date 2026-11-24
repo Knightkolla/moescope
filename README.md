@@ -65,7 +65,7 @@ The same pattern shows up in the first three: in the most specialised layer, **c
 </tr>
 </table>
 
-> Each run uses ~8k tokens of hand-written text. The numbers show what the log can reveal; they are not a study of these models (see [Routing at scale](#routing-at-scale) for that). Granite-1B ran on Colab; the others on Kaggle (transformers 5.20).
+> Each run uses ~8k tokens of hand-written text. The numbers show what the log can reveal; they are not a study of these models. Granite-1B ran on Colab; the others on Kaggle (transformers 5.20).
 >
 > ¹ Measured with the earlier one-thread-per-token kernel. ² fp16 model split over two T4s; each layer's logits are copied to the logging GPU first.
 
