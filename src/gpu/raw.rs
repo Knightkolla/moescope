@@ -41,14 +41,19 @@ unsafe impl DeviceRepr for Route {}
 // SAFETY: all-zero bits are a valid `Route` (expert 0, gate 0.0).
 unsafe impl ValidAsZeroBits for Route {}
 
-/// Threads per block for the one-thread-per-token kernels. Each thread holds
+/// Threads per block. A block holds `BLOCK / lanes` tokens; every lane keeps
 /// two MAX_K arrays, so a modest block size keeps register pressure sane.
 const BLOCK: u32 = 256;
 
-/// Grid covering `num_tokens` threads, one token each.
-fn per_token_config(num_tokens: u32) -> LaunchConfig {
+/// Grid covering `num_tokens` tokens with `lanes` threads each. The total is
+/// rounded up to whole blocks, so every warp is full (the kernels' shuffles
+/// need all 32 lanes) and threads past the last token sit out.
+fn per_token_config(num_tokens: u32, lanes: u32) -> LaunchConfig {
+    let threads = num_tokens as u64 * lanes as u64;
+    let blocks = threads.div_ceil(BLOCK as u64);
+    assert!(blocks <= i32::MAX as u64, "grid too large");
     LaunchConfig {
-        grid_dim: (num_tokens.div_ceil(BLOCK), 1, 1),
+        grid_dim: (blocks as u32, 1, 1),
         block_dim: (BLOCK, 1, 1),
         shared_mem_bytes: 0,
     }
@@ -73,6 +78,7 @@ pub(super) fn launch_route(
     assert_eq!(logits.len(), num_tokens as usize * num_experts as usize);
     assert_eq!(out.len(), num_tokens as usize * k as usize);
     assert!(k >= 1 && k as usize <= super::kernels::MAX_K && num_tokens > 0);
+    let lanes = super::kernels::lanes_per_token(num_experts);
     let mut launch = stream.launch_builder(func);
     launch
         .arg(logits)
@@ -80,13 +86,15 @@ pub(super) fn launch_route(
         .arg(&num_experts)
         .arg(&k)
         .arg(&mode)
-        .arg(out);
+        .arg(out)
+        .arg(&lanes);
     // SAFETY: argument order and types match the kernel signature
-    // (const float*, uint, uint, uint, int, RouteEntry*). Thread t reads
-    // logits[t*E .. t*E+E) and writes out[t*k .. t*k+k) only for t < num_tokens,
-    // which the length asserts above keep in bounds; k <= MAX_K keeps the
-    // per-thread arrays in bounds.
-    unsafe { launch.launch(per_token_config(num_tokens)) }?;
+    // (const float*, uint, uint, uint, int, RouteEntry*, uint). The lanes of
+    // token t read logits[t*E .. t*E+E) and write out[t*k .. t*k+k) only for
+    // t < num_tokens, which the length asserts above keep in bounds; k <= MAX_K
+    // keeps the per-lane arrays in bounds; lanes is a power of two <= 32 that
+    // divides the block, as the kernel's shuffles require.
+    unsafe { launch.launch(per_token_config(num_tokens, lanes)) }?;
     Ok(())
 }
 
@@ -245,6 +253,7 @@ pub(super) fn launch_route_dispatch_log(
     assert!(e <= u16::MAX as usize + 1 && p.layer_id <= u16::MAX as u32);
     assert!(p.token_offset as u64 + n as u64 <= u32::MAX as u64 + 1);
     let capacity = p.log.len() as u64;
+    let lanes = super::kernels::lanes_per_token(p.num_experts);
 
     let mut launch = stream.launch_builder(func);
     let foreign_ptr: CUdeviceptr;
@@ -274,13 +283,16 @@ pub(super) fn launch_route_dispatch_log(
         .arg(p.log)
         .arg(&capacity)
         .arg(p.log_counters)
-        .arg(&write_dispatch);
+        .arg(&write_dispatch)
+        .arg(&lanes);
     // SAFETY: argument order and types match the kernel signature
     // (const float*, uint x6 [one is int mode], RouteEntry*, uint*, uint*,
-    // TelemetryRecord*, unsigned long long, unsigned long long*, int). When
+    // TelemetryRecord*, unsigned long long, unsigned long long*, int, uint
+    // lanes: a power of two <= 32 dividing the block, so groups never
+    // straddle a warp and every warp is full for the shuffles). When
     // `dispatch` is None the three output pointers are null and
     // write_dispatch == 0, so the kernel never dereferences them. With the
-    // asserts above, for every thread t < n:
+    // asserts above, for every token t < n (any of its lanes):
     // * logits reads [t*E, t*E+E) and routes writes [t*k, t*k+k): in bounds.
     //   For foreign logits, borrow_foreign_f32 proved the n*E floats lie in
     //   one live allocation on this device. It stays live for the kernel:
@@ -293,6 +305,6 @@ pub(super) fn launch_route_dispatch_log(
     // * log is written only at idx < capacity == log.len();
     // * log_counters has exactly the 2 elements the kernel touches.
     // All flat indices fit in u32 (checked by the caller), so none wrap.
-    unsafe { launch.launch(per_token_config(p.num_tokens)) }?;
+    unsafe { launch.launch(per_token_config(p.num_tokens, lanes)) }?;
     Ok(())
 }
