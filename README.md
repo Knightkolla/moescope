@@ -9,7 +9,7 @@ moescope logs every routing decision on the GPU, inside a CUDA kernel, and hands
 ![Rust](https://img.shields.io/badge/Rust-core-orange?logo=rust)
 ![CUDA](https://img.shields.io/badge/CUDA-NVRTC-76B900?logo=nvidia)
 ![Python](https://img.shields.io/badge/Python-PyO3-3776AB?logo=python&logoColor=white)
-![Overhead](https://img.shields.io/badge/overhead-%3C1%25-brightgreen)
+![Overhead](https://img.shields.io/badge/overhead-%3C3%25-brightgreen)
 ![Parity](https://img.shields.io/badge/router%20parity-100%25-brightgreen)
 [![CI](https://github.com/Knightkolla/moescope/actions/workflows/ci.yml/badge.svg)](https://github.com/Knightkolla/moescope/actions/workflows/ci.yml)
 
@@ -36,24 +36,23 @@ No host sync per step and no Python lists. Every decision is either logged or co
 
 ## Results
 
-Three MoE models from two labs, each hooked on every MoE layer and fed the same code, maths, English and French text on a single Tesla T4:
+Four MoE models from three labs, each hooked on every MoE layer and fed the same code, maths, English and French text on Tesla T4s:
 
-| | Granite-3.1-1B-A400M | Granite-3.1-3B-A800M | OLMoE-1B-7B |
-|---|---:|---:|---:|
-| Lab | IBM | IBM | AllenAI |
-| Layers × experts, top-k | 24 × 32, top-8 | 32 × 40, top-8 | 16 × 64, top-8 |
-| Gate mode | top-k → softmax | top-k → softmax | softmax → top-k |
-| Decisions logged | **1,631,232** | **2,174,976** | **1,017,856** |
-| Dropped | 0 | 0 | 0 |
-| Match with the model's own router | **100.00%** (203,904) | **100.00%** (271,872) | **100.00%** (127,232) |
-| Forward-pass cost of logging | +2.8%¹ | **+0.7%** | **+0.7%** |
-| Busiest expert vs fair share | 1.8–4.0× | 2.3–5.0× | 3.1–4.8× |
-| Near-idle experts (<10% of fair share) | 17 of 768 | 64 of 1,280 | 26 of 1,024 |
-| Most domain-specialised layer | 14 | 22 | 15 |
+| | Granite-3.1-1B-A400M | Granite-3.1-3B-A800M | OLMoE-1B-7B | LFM2-8B-A1B |
+|---|---:|---:|---:|---:|
+| Lab | IBM | IBM | AllenAI | Liquid AI |
+| MoE layers × experts, top-k | 24 × 32, top-8 | 32 × 40, top-8 | 16 × 64, top-8 | 22 × 32, top-4 |
+| Routing | top-k → softmax | top-k → softmax | softmax → top-k | sigmoid + selection bias, renormalized |
+| Decisions logged | **1,631,232** | **2,174,976** | **1,017,856** | **680,064** |
+| Dropped | 0 | 0 | 0 | 0 |
+| Match with the model's own router | **100.00%** (203,904) | **100.00%** (271,872) | **100.00%** (127,232) | **100.00%** (170,016) |
+| Forward-pass cost of logging | +2.8%¹ | **+0.7%** | **+0.7%** | +2.6%² |
+| Busiest expert vs fair share | 1.8–4.0× | 2.3–5.0× | 3.1–4.8× | 1.6–3.9× |
+| Near-idle experts (<10% of fair share) | 17 of 768 | 64 of 1,280 | 26 of 1,024 | 3 of 704 |
 
 "Match" compares moescope's expert set for every (layer, token) with the experts the model itself picked in the same forward pass.
 
-The same pattern shows up in all three: in the most specialised layer, **code and maths share an expert** (Granite-1B layer 14: expert 13; Granite-3B layer 22: expert 27; OLMoE layer 15: experts 17 and 30), while prose and French spread across others. In OLMoE, routing gets both more domain-specific and more confident with depth.
+The same pattern shows up in the first three: in the most specialised layer, **code and maths share an expert** (Granite-1B layer 14: expert 13; Granite-3B layer 22: expert 27; OLMoE layer 15: experts 17 and 30), while prose and French spread across others. In OLMoE, routing gets both more domain-specific and more confident with depth.
 
 <table>
 <tr>
@@ -66,9 +65,9 @@ The same pattern shows up in all three: in the most specialised layer, **code an
 </tr>
 </table>
 
-> Each run uses ~8k tokens of hand-written text. The numbers show what the log can reveal; they are not a study of these models. Granite-1B ran on Colab; Granite-3B and OLMoE on Kaggle (transformers 5.20).
+> Each run uses ~8k tokens of hand-written text. The numbers show what the log can reveal; they are not a study of these models (see [Routing at scale](#routing-at-scale) for that). Granite-1B ran on Colab; the others on Kaggle (transformers 5.20).
 >
-> ¹ Measured with the earlier one-thread-per-token kernel; the other two use the current one.
+> ¹ Measured with the earlier one-thread-per-token kernel. ² fp16 model split over two T4s; each layer's logits are copied to the logging GPU first.
 
 ## Quick start
 
@@ -168,25 +167,27 @@ moescope costs about the same as keeping tensors on the GPU yourself. What it ad
 
 ## Stress test
 
-`bench/stress_test.py` pushes the logging path far beyond a normal forward pass and checks every result against torch. All 21 checks passed on a T4:
+`bench/stress_test.py` pushes the logging path far beyond a normal forward pass and checks every result against torch. All checks pass on a T4:
 
 | check | result |
 |---|---|
 | Correctness | 66 (experts, k, mode) combinations, E = 8 to 256, k = 1 to 32: **17.3M tokens**, every expert choice matches torch, worst gate error 9e-7 |
-| Volume | **98.6M decisions (1.18 GB)** in one buffer, 0 dropped, per-expert histogram identical to torch's, drained in 4.8 s |
+| Volume | **98.6M decisions (1.18 GB)** in one buffer, 0 dropped, per-expert histogram identical to torch's, drained in 4.9 s |
 | Overflow | 3M decisions into a 1M-record buffer: kept exactly 1,000,000, counted exactly 2,000,000 dropped; buffer reusable after drain; 200 log/drain cycles |
 | Odd inputs | all-equal logits, NaN, ±1e30, k = E, E = 65,536, fp16 / bf16, non-contiguous and 3-D tensors, logits produced on a side CUDA stream |
 
-Throughput of one `route_and_log` call (T4, 1M tokens):
+Throughput of one `route_and_log` call (T4, 1M tokens; torch only computes the routing, moescope also logs it):
 
-| experts, k | moescope | torch softmax + topk alone |
+| routing | moescope | torch, same routing |
 |---|---:|---:|
-| 8, top-2 | **0.50 ms** (4.2 G decisions/s) | 17.5 ms |
-| 32, top-8 | **3.9 ms** (2.2 G decisions/s) | 18.7 ms |
-| 64, top-8 | **8.5 ms** (1.0 G decisions/s) | 25.7 ms |
-| 128, top-8 | **18.3 ms** (0.46 G decisions/s) | 44.3 ms |
+| 8 experts, top-2 | **0.34 ms** (6.2 G decisions/s) | 17.5 ms |
+| 32 experts, top-8 | **3.7 ms** | 18.2 ms |
+| 64 experts, top-8 | **8.0 ms** | 26.0 ms |
+| 128 experts, top-8 | **16.5 ms** | 43.8 ms |
+| DeepSeek-V3: 256 experts, sigmoid + bias, 8 groups / top 4, top-8 | **50.9 ms** | 268 ms |
+| 64 experts, fp16 / bf16 logits read in place | **8.1 / 8.9 ms** | – |
 
-moescope routes, gates and logs every token faster than torch can merely pick the top-k, at every expert count tested. Each token is handled by a group of 2–32 threads (sized to the expert count): they read the row together in one coalesced pass, then pick the top-k in k rounds of warp-shuffle reductions. An earlier one-thread-per-token kernel was 2× *slower* than torch at 128 experts; this design made it 5× faster there.
+Each token is handled by a group of 2–32 threads, sized to the expert count. They read the row together in one coalesced pass, pick the top-k in k rounds of warp-shuffle reductions, and keep only their own ≤ 4 output slots, in registers (no local memory). The kernel is compiled once per (logits dtype, softmax/sigmoid) combination, so neither choice costs anything in the inner loop.
 
 ## What it is / isn't
 
