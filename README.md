@@ -139,7 +139,7 @@ A full report (figure, raw log, `summary.json`):
 ```sh
 python examples/analyze_routing.py                                       # Granite-3.1-1B-A400M
 python examples/analyze_routing.py --model allenai/OLMoE-1B-7B-0924
-python examples/analyze_routing.py --model LiquidAI/LFM2-8B-A1B --load-4bit   
+python examples/analyze_routing.py --model LiquidAI/LFM2-8B-A1B --device-map auto
 python examples/analyze_routing.py --toy deepseek_v3                     # tiny offline model
 ```
 

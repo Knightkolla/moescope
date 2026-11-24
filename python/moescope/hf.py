@@ -189,6 +189,10 @@ class Session:
             import torch
 
             self._device = torch.device("cuda", _router_weight(next(iter(routers.values()))).device.index or 0)
+            # Token ids come from a device counter moved by a tiny kernel after
+            # each pass, so they stay right when the model runs from a
+            # captured CUDA graph (vLLM / SGLang style decoding).
+            recorder.set_device_token_ids(True)
 
     # -- hooks -------------------------------------------------------------
     def _router_hook(self, layer_id: int):
@@ -204,7 +208,8 @@ class Session:
                 import torch
 
                 torch.cuda.current_stream(self._device).synchronize()
-            route_and_log(logits, k=self.spec.k, layer_id=layer_id, token_offset=self.offset, recorder=self.recorder)
+            offset = 0 if self._device is not None else self.offset  # GPU: device counter
+            route_and_log(logits, k=self.spec.k, layer_id=layer_id, token_offset=offset, recorder=self.recorder)
             self._pass_tokens = logits.shape[0]
             if self.check and indices is not None:
                 w = None if weights is None else weights.reshape(-1, self.spec.k).float().cpu()
@@ -213,6 +218,11 @@ class Session:
         return hook
 
     def _model_hook(self, *_args):
+        if self._device is not None and self._pass_tokens:
+            import torch
+
+            with torch.cuda.device(self._device):
+                self.recorder.advance_tokens(self._pass_tokens, stream=torch.cuda.current_stream().cuda_stream)
         self.offset += self._pass_tokens
         self._pass_tokens = 0
 
@@ -232,7 +242,10 @@ class Session:
         for layer_id, router in self.routers.items():
             bias = selection_bias(router._moescope_layer, router._moescope_path)
             if bias is not None:
-                self.recorder.set_bias(layer_id, bias.detach().float().cpu().numpy())
+                import torch
+
+                half = bias.dtype in (torch.float16, torch.bfloat16)
+                self.recorder.set_bias(layer_id, bias.detach().float().cpu().numpy(), half=half)
 
     def detach(self) -> None:
         """Removes every hook. The log stays readable with :meth:`drain`."""

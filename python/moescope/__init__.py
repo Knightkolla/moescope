@@ -28,6 +28,7 @@ from ._native import Recorder, built_with_cuda, cuda_available
 __all__ = [
     "RECORD_DTYPE",
     "Recorder",
+    "advance_tokens",
     "attach",
     "built_with_cuda",
     "configure",
@@ -101,6 +102,17 @@ def _recorder(recorder: Optional[Recorder]) -> Recorder:
     return _default if _default is not None else configure()
 
 
+def _torch_dtypes():
+    try:
+        import torch
+    except ImportError:
+        return {}
+    return {torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16"}
+
+
+_TORCH_DTYPES = _torch_dtypes()
+
+
 def _is_torch_tensor(x: Any) -> bool:
     return type(x).__module__.startswith("torch") and hasattr(x, "data_ptr")
 
@@ -116,8 +128,9 @@ def route_and_log(
 
     logits: router logits, ``[..., num_experts]`` (leading dims are
         flattened into tokens, row-major), as a numpy array or torch tensor.
-        A CUDA tensor with the CUDA backend is read in place (zero-copy, no
-        host sync); anything else is copied to host first.
+        A CUDA tensor (float32 / float16 / bfloat16) with the CUDA backend is
+        read in place on the current stream (zero-copy, no host sync, CUDA
+        graph capturable); anything else is copied to host first.
     k: experts per token.
     layer_id: tag stored in every record (0-65535).
     token_offset: added to the flattened token index to form ``token_id``.
@@ -129,17 +142,34 @@ def route_and_log(
         if x.is_cuda and rec.backend == "cuda":
             import torch
 
-            x = x.to(torch.float32).contiguous()
-            # Our kernel runs on the legacy default stream; make sure logits
-            # produced on any other stream are finished first.
-            if torch.cuda.current_stream(x.device) != torch.cuda.default_stream(x.device):
-                torch.cuda.current_stream(x.device).synchronize()
-            rec.route_and_log_device(x.data_ptr(), x.shape[0], x.shape[1], k, layer_id, token_offset)
+            dtype = _TORCH_DTYPES.get(x.dtype)
+            if dtype is None:
+                x, dtype = x.float(), "float32"
+            x = x.contiguous()
+            # Launch on the caller's current stream: ordered after the op that
+            # produced the logits, no host sync, and capturable in a CUDA graph.
+            stream = torch.cuda.current_stream(x.device).cuda_stream
+            rec.route_and_log_device(
+                x.data_ptr(), x.shape[0], x.shape[1], k, layer_id, token_offset, dtype=dtype, stream=stream
+            )
             return
         logits = x.float().cpu().numpy()
     x = np.ascontiguousarray(logits, dtype=np.float32)
     x = x.reshape(-1, x.shape[-1])
     rec.route_and_log(x, k, layer_id, token_offset)
+
+
+def advance_tokens(n: int, recorder: Optional[Recorder] = None) -> None:
+    """With device-side token ids (``Recorder.set_device_token_ids(True)``),
+    moves the token counter past a forward pass of ``n`` tokens, on the
+    current CUDA stream. Inside a captured CUDA graph this is recorded too,
+    so each replay logs new token ids."""
+    rec = _recorder(recorder)
+    if rec.backend != "cuda":
+        return
+    import torch
+
+    rec.advance_tokens(n, stream=torch.cuda.current_stream().cuda_stream)
 
 
 def drain_with_stats(recorder: Optional[Recorder] = None) -> Tuple[np.ndarray, int]:

@@ -17,8 +17,11 @@ pub fn cuda_available() -> bool {
     unsafe { cudarc::driver::sys::is_culib_present() && cudarc::nvrtc::sys::is_culib_present() }
 }
 
+use std::sync::Arc;
+
 use cudarc::driver::sys::{
-    CUdeviceptr, CUpointer_attribute, cuMemGetAddressRange_v2, cuPointerGetAttribute,
+    CUcontext, CUdeviceptr, CUpointer_attribute, CUstream, cuMemGetAddressRange_v2,
+    cuPointerGetAttribute, cuStreamGetCtx,
 };
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig,
@@ -41,9 +44,37 @@ unsafe impl DeviceRepr for Route {}
 // SAFETY: all-zero bits are a valid `Route` (expert 0, gate 0.0).
 unsafe impl ValidAsZeroBits for Route {}
 
-/// Kernel-side gating parameters, passed by value. Mirrors `GateParams` in
-/// the CUDA source: { int, uint, uint, int, float, uint, const float* },
-/// 32 bytes, the pointer 8-byte aligned at offset 24.
+/// Element type of router logits in device memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogitsDtype {
+    F32,
+    F16,
+    BF16,
+}
+
+impl LogitsDtype {
+    /// Bytes per element.
+    pub fn size(self) -> usize {
+        match self {
+            LogitsDtype::F32 => 4,
+            LogitsDtype::F16 | LogitsDtype::BF16 => 2,
+        }
+    }
+
+    /// Kernel encoding (`GateParams.logits_dtype`).
+    fn code(self) -> i32 {
+        match self {
+            LogitsDtype::F32 => 0,
+            LogitsDtype::F16 => 1,
+            LogitsDtype::BF16 => 2,
+        }
+    }
+}
+
+/// Kernel-side parameters, passed by value. Mirrors `GateParams` in the
+/// CUDA source: { int, uint, uint, int, float, int, const float*,
+/// const unsigned long long*, int, int }, 48 bytes, pointers 8-byte aligned
+/// at 24, 32.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct GateParams {
@@ -52,10 +83,13 @@ struct GateParams {
     top_groups: u32,
     normalize: i32,
     scale: f32,
-    pad: u32,
+    logits_dtype: i32,
     bias: CUdeviceptr,
+    token_base: CUdeviceptr,
+    round_biased: i32,
+    pad: i32,
 }
-const _: () = assert!(std::mem::size_of::<GateParams>() == 32);
+const _: () = assert!(std::mem::size_of::<GateParams>() == 48);
 
 // SAFETY: `GateParams` is `#[repr(C)]` plain data (integers, a float and a
 // device address) with the same layout as the CUDA struct (size asserted).
@@ -68,6 +102,8 @@ unsafe impl DeviceRepr for GateParams {}
 pub(super) struct GateArg<'a> {
     pub gating: Gating,
     pub bias: Option<&'a CudaSlice<f32>>,
+    /// Round score + bias to the logits' half precision before ranking.
+    pub round_biased: bool,
 }
 
 impl GateArg<'_> {
@@ -88,17 +124,31 @@ impl GateArg<'_> {
 /// Pushes `gate` as the kernel's `GateParams` argument. The returned guard
 /// (cudarc's stream-ordering hook for the bias buffer) must outlive the
 /// launch, so the caller keeps it until after `launch`.
-fn push_gate<'a>(
+type Guard<'a> = Option<cudarc::driver::SyncOnDrop<'a>>;
+
+/// Device address of an optional buffer (0 for None) plus cudarc's
+/// stream-ordering guard, which must outlive the launch that uses it.
+fn ptr_of<'a, T>(
+    buf: Option<&'a CudaSlice<T>>,
     stream: &'a CudaStream,
-    gate: GateArg<'a>,
-) -> (GateParams, Option<cudarc::driver::SyncOnDrop<'a>>) {
-    let (bias, guard) = match gate.bias {
+) -> (CUdeviceptr, Guard<'a>) {
+    match buf {
         Some(b) => {
             let (ptr, guard) = b.device_ptr(stream);
             (ptr, Some(guard))
         }
         None => (0, None),
-    };
+    }
+}
+
+fn push_gate<'a>(
+    stream: &'a CudaStream,
+    gate: GateArg<'a>,
+    logits_dtype: LogitsDtype,
+    token_base: Option<&'a CudaSlice<u64>>,
+) -> (GateParams, [Guard<'a>; 2]) {
+    let (bias, bias_guard) = ptr_of(gate.bias, stream);
+    let (token_base, token_guard) = ptr_of(token_base, stream);
     let g = gate.gating;
     let (num_groups, top_groups) = g
         .groups
@@ -113,10 +163,13 @@ fn push_gate<'a>(
         top_groups,
         normalize: g.normalize as i32,
         scale: g.scale,
-        pad: 0,
+        logits_dtype: logits_dtype.code(),
         bias,
+        token_base,
+        round_biased: gate.round_biased as i32,
+        pad: 0,
     };
-    (params, guard)
+    (params, [bias_guard, token_guard])
 }
 
 /// Threads per block. A block holds `BLOCK / lanes` tokens; every lane keeps
@@ -158,7 +211,7 @@ pub(super) fn launch_route(
     assert!(k >= 1 && k as usize <= super::kernels::MAX_K && num_tokens > 0);
     gate.check(num_experts as usize);
     let lanes = super::kernels::lanes_per_token(num_experts);
-    let (params, _bias_guard) = push_gate(stream, gate);
+    let (params, _guards) = push_gate(stream, gate, LogitsDtype::F32, None);
     let mut launch = stream.launch_builder(func);
     launch
         .arg(logits)
@@ -182,14 +235,15 @@ pub(super) fn launch_route(
 
 /// A device pointer owned by another library (e.g. a torch CUDA tensor's
 /// `data_ptr()`), checked against the driver to cover `len` f32s inside one
-/// live allocation on our device. Only constructible via [`borrow_foreign_f32`].
+/// live allocation on our device. Only constructible via [`borrow_foreign`].
 #[derive(Debug, Clone, Copy)]
-pub struct ForeignF32 {
+pub struct ForeignLogits {
     ptr: CUdeviceptr,
     len: usize,
+    dtype: LogitsDtype,
 }
 
-impl ForeignF32 {
+impl ForeignLogits {
     /// Number of f32 elements covered.
     pub fn len(&self) -> usize {
         self.len
@@ -213,11 +267,13 @@ pub enum ForeignPtrError {
         expected: usize,
         found: i32,
     },
-    /// `[ptr, ptr + len*4)` runs past the end of the allocation.
+    /// `[ptr, ptr + len * element size)` runs past the end of the allocation.
     OutOfRange {
         needed: usize,
         available: usize,
     },
+    /// A stream handle that is not a stream of this GPU's context.
+    ForeignStream,
 }
 
 /// Validates `ptr` as `len` f32s of device memory usable from `ctx`.
@@ -230,15 +286,16 @@ pub enum ForeignPtrError {
 /// allocators (torch) carve many tensors out of one segment, so a wrong
 /// `len` can still read a neighbouring tensor's bytes (wrong telemetry) -
 /// but never unmapped or freed memory.
-pub(super) fn borrow_foreign_f32(
+pub(super) fn borrow_foreign(
     ctx: &CudaContext,
     ptr: u64,
     len: usize,
-) -> Result<Result<ForeignF32, ForeignPtrError>, cudarc::driver::DriverError> {
+    dtype: LogitsDtype,
+) -> Result<Result<ForeignLogits, ForeignPtrError>, cudarc::driver::DriverError> {
     if ptr == 0 {
         return Ok(Err(ForeignPtrError::Null));
     }
-    if !ptr.is_multiple_of(std::mem::align_of::<f32>() as u64) {
+    if !ptr.is_multiple_of(dtype.size() as u64) {
         return Ok(Err(ForeignPtrError::Misaligned));
     }
     ctx.bind_to_thread()?;
@@ -266,20 +323,20 @@ pub(super) fn borrow_foreign_f32(
             found: ordinal,
         }));
     }
-    let needed = len.saturating_mul(4);
+    let needed = len.saturating_mul(dtype.size());
     let available = (base as usize + size).saturating_sub(ptr as usize);
     if needed > available {
         return Ok(Err(ForeignPtrError::OutOfRange { needed, available }));
     }
-    Ok(Ok(ForeignF32 { ptr, len }))
+    Ok(Ok(ForeignLogits { ptr, len, dtype }))
 }
 
 /// Where a kernel reads its logits from.
 pub(super) enum LogitsArg<'a> {
     /// A buffer we allocated and filled from host memory.
     Owned(&'a CudaSlice<f32>),
-    /// Another library's device memory, validated by [`borrow_foreign_f32`].
-    Foreign(ForeignF32),
+    /// Another library's device memory, validated by [`borrow_foreign`].
+    Foreign(ForeignLogits),
 }
 
 impl LogitsArg<'_> {
@@ -289,6 +346,68 @@ impl LogitsArg<'_> {
             LogitsArg::Foreign(f) => f.len,
         }
     }
+
+    fn dtype(&self) -> LogitsDtype {
+        match self {
+            LogitsArg::Owned(_) => LogitsDtype::F32,
+            LogitsArg::Foreign(f) => f.dtype,
+        }
+    }
+}
+
+/// Wraps another library's CUDA stream (e.g. torch's current stream,
+/// `torch.cuda.current_stream().cuda_stream`) so our kernels are ordered
+/// with the model's work without any host synchronization, and so they can
+/// be recorded into a CUDA graph being captured on that stream.
+///
+/// `handle == 0` (the legacy default stream) returns `None`: use the
+/// router's own default stream, which is that same stream.
+pub(super) fn borrow_stream(
+    ctx: &Arc<CudaContext>,
+    handle: u64,
+) -> Result<Result<Option<Arc<CudaStream>>, ForeignPtrError>, cudarc::driver::DriverError> {
+    if handle == 0 {
+        return Ok(Ok(None));
+    }
+    ctx.bind_to_thread()?;
+    let stream = handle as usize as CUstream;
+    let mut owner: CUcontext = std::ptr::null_mut();
+    // SAFETY: `owner` is a live local of the out-parameter's type; the driver
+    // only inspects `stream` and returns an error for an invalid handle.
+    let rc = unsafe { cuStreamGetCtx(stream, &mut owner) };
+    if rc.result().is_err() || owner != ctx.cu_ctx() {
+        return Ok(Err(ForeignPtrError::ForeignStream));
+    }
+    // SAFETY: the driver just confirmed `stream` is a valid stream of this
+    // context. The caller (Python, holding the torch stream) keeps it alive
+    // for the duration of the call; the wrapper is not owning, so dropping
+    // it never destroys the stream, and work already enqueued on a stream
+    // completes even if its owner destroys it later. Our buffers are used on
+    // it only through stream-ordered launches; `TelemetryBuffer::drain`
+    // synchronizes the whole context before reading them.
+    Ok(Ok(Some(unsafe { ctx.wrap_borrowed_stream(stream) })))
+}
+
+/// Launches `moe_advance_tokens`: `*token_base += n` on `stream`.
+pub(super) fn launch_advance_tokens(
+    stream: &CudaStream,
+    func: &CudaFunction,
+    token_base: &mut CudaSlice<u64>,
+    n: u64,
+) -> Result<(), cudarc::driver::DriverError> {
+    assert_eq!(token_base.len(), 1);
+    let mut launch = stream.launch_builder(func);
+    launch.arg(token_base).arg(&n);
+    // SAFETY: matches `moe_advance_tokens(unsigned long long*, unsigned long
+    // long)`; one thread writes element 0 of a 1-element buffer.
+    unsafe {
+        launch.launch(LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }?;
+    Ok(())
 }
 
 /// Device buffers and scalars for one `moe_route_dispatch_log` launch.
@@ -298,6 +417,8 @@ pub(super) struct DispatchLaunch<'a> {
     pub num_experts: u32,
     pub k: u32,
     pub gate: GateArg<'a>,
+    /// Device token counter added to token ids (CUDA-graph-safe), or None.
+    pub token_base: Option<&'a CudaSlice<u64>>,
     pub layer_id: u32,
     pub token_offset: u32,
     /// `None` = telemetry-only: the kernel skips routes/dispatch entirely.
@@ -337,7 +458,10 @@ pub(super) fn launch_route_dispatch_log(
     let capacity = p.log.len() as u64;
     let lanes = super::kernels::lanes_per_token(p.num_experts);
     p.gate.check(e);
-    let (params, _bias_guard) = push_gate(stream, p.gate);
+    if let Some(tb) = p.token_base {
+        assert_eq!(tb.len(), 1);
+    }
+    let (params, _guards) = push_gate(stream, p.gate, p.logits.dtype(), p.token_base);
 
     let mut launch = stream.launch_builder(func);
     let foreign_ptr: CUdeviceptr;
@@ -387,7 +511,10 @@ pub(super) fn launch_route_dispatch_log(
     //   returned is < n (counts were zeroed and each token hits e at most
     //   once), so gathered[e*n + slot] < E*n is in bounds;
     // * GateParams.bias is null or a live device buffer of exactly E floats
-    //   (gate.check), read only at expert indices < E;
+    //   (gate.check), read only at expert indices < E; token_base is null or
+    //   a live 1-element u64 buffer (asserted), only read;
+    // * logits are read as GateParams.logits_dtype, the dtype the foreign
+    //   pointer was validated for (n*E elements of that size);
     // * log is written only at idx < capacity == log.len();
     // * log_counters has exactly the 2 elements the kernel touches.
     // All flat indices fit in u32 (checked by the caller), so none wrap.

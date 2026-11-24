@@ -1,0 +1,80 @@
+# Builds wheels on a version tag (v*) or by hand, and publishes them to PyPI
+# with trusted publishing (no API token stored in the repo).
+#
+# One-time setup on pypi.org: Account -> Publishing -> add a "pending
+# publisher" for project "moescope", this repository, workflow
+# "release.yml", environment "pypi". Then: git tag v0.2.0 && git push --tags
+#
+# Linux wheels include the CUDA backend (built against the CUDA 12.4 driver
+# API, which newer drivers, CUDA 13 included, still serve). It is loaded at
+# run time: without an NVIDIA driver the same wheel falls back to the CPU
+# router. macOS wheels are CPU only.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: "2_28"
+          args: --release --find-interpreter -F python,pyo3/extension-module,cuda-12040 -o dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux
+          path: dist
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.9
+            3.10
+            3.11
+            3.12
+            3.13
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64
+          args: --release --find-interpreter -o dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: -o dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    needs: [linux, macos, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -24,7 +24,7 @@ pip install -q --force-reinstall --no-deps dist/moescope-*.whl
 python -c "import moescope; assert moescope.cuda_available(); print('moescope CUDA backend OK')"
 
 echo "== attach() parity on the GPU kernel (tiny real-architecture models)"
-MOESCOPE_DEVICE=cuda python -m pytest -q tests/python/test_hf_attach.py
+MOESCOPE_DEVICE=cuda python -m pytest -q tests/python/test_hf_attach.py tests/python/test_cuda_streams.py
 
 echo "== stress test"
 python bench/stress_test.py --out bench/results/stress_t4.json
@@ -32,7 +32,8 @@ python bench/stress_test.py --out bench/results/stress_t4.json
 for m in "${MODELS[@]}"; do
   echo "== $m"
   flags=""
-  case "$m" in *LFM2-8B*|*Moonlight*|*DeepSeek-V2-Lite*) flags="--load-4bit";; esac
+  # fp16 LFM2-8B (17 GB) is split over Kaggle's two T4s
+  case "$m" in *LFM2-8B*) flags="--device-map auto";; esac
   python examples/analyze_routing.py --model "$m" --out "results/${m##*/}" $flags
   rm -rf ~/.cache/huggingface/hub/models--"${m//\//--}"  # free disk for the next model
 done

@@ -238,6 +238,45 @@ def test_throughput():
             print(f"     E={e:<4} k={k} tokens={n:>9,}: moescope {ms:7.3f} ms "
                   f"({row['decisions_per_s'] / 1e9:.2f} G decisions/s) | torch softmax+topk alone {ms_torch:7.3f} ms")
 
+    # DeepSeek-V3 routing (256 experts, sigmoid + bias, 8 groups, top 4 groups,
+    # k = 8, normalized, x2.5) vs the same computation in torch, as written in
+    # transformers' DeepseekV3TopkRouter.
+    e, k, groups, top = 256, 8, 8, 4
+    bias = torch.randn(e, device=DEV) * 0.1
+
+    def torch_deepseek(x):
+        scores = x.sigmoid()
+        choice = scores + bias
+        g = choice.view(-1, groups, e // groups).topk(2, -1)[0].sum(-1)
+        keep = torch.zeros_like(g).scatter_(1, g.topk(top, -1, sorted=False)[1], 1)
+        mask = keep.unsqueeze(-1).expand(-1, groups, e // groups).reshape(-1, e)
+        idx = choice.masked_fill(~mask.bool(), float("-inf")).topk(k, -1, sorted=False)[1]
+        w = scores.gather(1, idx)
+        return idx, w / (w.sum(-1, keepdim=True) + 1e-20) * 2.5
+
+    for n in (65536, 1 << 20):
+        x = torch.randn(n, e, device=DEV)
+        moescope.configure(capacity=60 * n * k, mode="sigmoid", device="cuda", normalize=True, scale=2.5,
+                           n_group=groups, topk_group=top)
+        moescope.set_bias(0, bias)
+        ms = bench(lambda: moescope.route_and_log(x, k=k, layer_id=0))
+        moescope.drain_with_stats()
+        ms_torch = bench(lambda: torch_deepseek(x))
+        row = dict(experts=e, k=k, tokens=n, mode="deepseek_v3", moescope_ms=round(ms, 4),
+                   torch_topk_ms=round(ms_torch, 4), decisions_per_s=round(n * k / ms * 1e3))
+        results["throughput"].append(row)
+        print(f"     DeepSeek-V3 routing, tokens={n:>9,}: moescope {ms:7.3f} ms "
+              f"({row['decisions_per_s'] / 1e9:.2f} G decisions/s) | torch (same routing) {ms_torch:7.3f} ms")
+
+    # Half-precision logits are read in place (no float32 copy).
+    for dt in (torch.float16, torch.bfloat16):
+        x = torch.randn(1 << 20, 64, device=DEV).to(dt)
+        moescope.configure(capacity=60 * (1 << 20) * 8, mode="softmax_topk", device="cuda")
+        ms = bench(lambda: moescope.route_and_log(x, k=8, layer_id=0))
+        moescope.drain_with_stats()
+        print(f"     E=64   k=8 tokens=1,048,576 {str(dt)[6:]:>8} logits: moescope {ms:7.3f} ms")
+        results["throughput"].append(dict(experts=64, k=8, tokens=1 << 20, dtype=str(dt)[6:], moescope_ms=round(ms, 4)))
+
 
 def main():
     ap = argparse.ArgumentParser()

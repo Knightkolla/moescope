@@ -3,7 +3,7 @@
 pub mod kernels;
 mod raw;
 
-pub use raw::{ForeignF32, ForeignPtrError, cuda_available};
+pub use raw::{ForeignLogits, ForeignPtrError, LogitsDtype, cuda_available};
 
 use std::sync::Arc;
 
@@ -125,6 +125,9 @@ fn copy_prefix<T: cudarc::driver::DeviceRepr>(
 /// [`GpuRouter::upload_bias`] and reuse it for every batch.
 pub struct DeviceBias {
     buf: CudaSlice<f32>,
+    /// The model keeps this bias in half precision (see
+    /// [`GpuRouter::upload_bias_half`]).
+    half: bool,
 }
 
 impl DeviceBias {
@@ -186,6 +189,7 @@ impl<'a> GpuGate<'a> {
         raw::GateArg {
             gating: self.gating,
             bias: self.bias.map(|b| &b.buf),
+            round_biased: self.bias.is_some_and(|b| b.half),
         }
     }
 }
@@ -239,6 +243,7 @@ pub struct GpuRouter {
     stream: Arc<CudaStream>,
     route_fn: CudaFunction,
     dispatch_log_fn: CudaFunction,
+    advance_fn: CudaFunction,
 }
 
 impl GpuRouter {
@@ -249,6 +254,7 @@ impl GpuRouter {
         Ok(GpuRouter {
             route_fn: module.load_function(kernels::ROUTE_KERNEL)?,
             dispatch_log_fn: module.load_function(kernels::DISPATCH_LOG_KERNEL)?,
+            advance_fn: module.load_function(kernels::ADVANCE_TOKENS_KERNEL)?,
             stream: ctx.default_stream(),
         })
     }
@@ -268,6 +274,18 @@ impl GpuRouter {
         }
         Ok(DeviceBias {
             buf: self.stream.clone_htod(bias)?,
+            half: false,
+        })
+    }
+
+    /// [`upload_bias`](Self::upload_bias) for a model that keeps the bias
+    /// in the same half precision as its logits: score + bias is then
+    /// rounded to that precision before ranking, exactly as torch adds two
+    /// half tensors. (No effect on float32 logits.)
+    pub fn upload_bias_half(&self, bias: &[f32]) -> Result<DeviceBias, GpuError> {
+        Ok(DeviceBias {
+            half: true,
+            ..self.upload_bias(bias)?
         })
     }
 
@@ -373,9 +391,13 @@ impl GpuRouter {
         if num_tokens == 0 {
             return self.empty_dispatch(num_experts);
         }
-        let foreign =
-            raw::borrow_foreign_f32(self.stream.context(), logits_ptr, num_tokens * num_experts)?
-                .map_err(GpuError::ForeignPtr)?;
+        let foreign = raw::borrow_foreign(
+            self.stream.context(),
+            logits_ptr,
+            num_tokens * num_experts,
+            LogitsDtype::F32,
+        )?
+        .map_err(GpuError::ForeignPtr)?;
         self.launch_dispatch(
             raw::LogitsArg::Foreign(foreign),
             shape,
@@ -425,15 +447,21 @@ impl GpuRouter {
         self.launch(logits, shape, gate, layer_id, token_offset, log, None)
     }
 
-    /// Zero-copy [`log_only`](Self::log_only) for logits already on the GPU
-    /// (same pointer validation and caller requirements as
-    /// [`route_dispatch_log_device`](Self::route_dispatch_log_device)). This
-    /// is what the Python `route_and_log` uses for CUDA tensors: one pointer
-    /// check plus one kernel launch per call.
+    /// Zero-copy [`log_only`](Self::log_only) for logits already on the GPU,
+    /// in float32, float16 or bfloat16 (same pointer validation and caller
+    /// requirements as [`route_dispatch_log_device`](Self::route_dispatch_log_device)).
+    /// This is what the Python `route_and_log` uses for CUDA tensors: one
+    /// pointer check plus one kernel launch per call.
+    ///
+    /// `stream` is a raw `CUstream` handle of this GPU's context to launch on
+    /// (torch: `torch.cuda.current_stream().cuda_stream`), or 0 for the
+    /// legacy default stream. Launching on the model's own stream needs no
+    /// host synchronization and works inside CUDA-graph capture.
     #[allow(clippy::too_many_arguments)]
     pub fn log_only_device<'g>(
         &self,
         logits_ptr: u64,
+        dtype: LogitsDtype,
         num_tokens: usize,
         num_experts: usize,
         k: usize,
@@ -441,6 +469,7 @@ impl GpuRouter {
         layer_id: u16,
         token_offset: u32,
         log: &mut TelemetryBuffer,
+        stream: u64,
     ) -> Result<(), GpuError> {
         let gate = gate.into();
         let shape = validate_shape_for_gpu(num_tokens, num_experts, k)?;
@@ -448,11 +477,40 @@ impl GpuRouter {
         if num_tokens == 0 {
             return Ok(());
         }
-        let foreign =
-            raw::borrow_foreign_f32(self.stream.context(), logits_ptr, num_tokens * num_experts)?
-                .map_err(GpuError::ForeignPtr)?;
+        let ctx = self.stream.context();
+        let foreign = raw::borrow_foreign(ctx, logits_ptr, num_tokens * num_experts, dtype)?
+            .map_err(GpuError::ForeignPtr)?;
+        let borrowed = raw::borrow_stream(ctx, stream)?.map_err(GpuError::ForeignPtr)?;
+        let stream = borrowed.as_ref().unwrap_or(&self.stream);
         let logits = raw::LogitsArg::Foreign(foreign);
-        self.launch(logits, shape, gate, layer_id, token_offset, log, None)
+        self.launch_on(
+            stream,
+            logits,
+            shape,
+            gate,
+            layer_id,
+            token_offset,
+            log,
+            None,
+        )
+    }
+
+    /// Adds `n` to `log`'s device-side token counter, on `stream` (a raw
+    /// `CUstream` handle, 0 = legacy default). Call it once after each
+    /// forward pass when the log uses device token ids
+    /// ([`TelemetryBuffer::set_device_token_ids`]); inside CUDA-graph
+    /// capture it is recorded and replays with the graph.
+    pub fn advance_tokens(
+        &self,
+        log: &mut TelemetryBuffer,
+        n: u64,
+        stream: u64,
+    ) -> Result<(), GpuError> {
+        let borrowed =
+            raw::borrow_stream(self.stream.context(), stream)?.map_err(GpuError::ForeignPtr)?;
+        let stream = borrowed.as_ref().unwrap_or(&self.stream);
+        raw::launch_advance_tokens(stream, &self.advance_fn, &mut log.tokens, n)?;
+        Ok(())
     }
 
     /// Shared tail of the dispatch entry points: allocate the per-call
@@ -498,11 +556,37 @@ impl GpuRouter {
         Ok(out)
     }
 
-    /// Id-range checks and the fused kernel launch (with or without the
-    /// dispatch outputs).
+    /// [`launch_on`](Self::launch_on) the router's own default stream.
     #[allow(clippy::too_many_arguments)]
     fn launch(
         &self,
+        logits: raw::LogitsArg<'_>,
+        shape: BatchShape,
+        gate: GpuGate<'_>,
+        layer_id: u16,
+        token_offset: u32,
+        log: &mut TelemetryBuffer,
+        dispatch: Option<raw::DispatchOutputs<'_>>,
+    ) -> Result<(), GpuError> {
+        let stream = self.stream.clone();
+        self.launch_on(
+            &stream,
+            logits,
+            shape,
+            gate,
+            layer_id,
+            token_offset,
+            log,
+            dispatch,
+        )
+    }
+
+    /// Id-range checks and the fused kernel launch (with or without the
+    /// dispatch outputs).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_on(
+        &self,
+        stream: &Arc<CudaStream>,
         logits: raw::LogitsArg<'_>,
         shape: BatchShape,
         gate: GpuGate<'_>,
@@ -518,8 +602,15 @@ impl GpuRouter {
             .into());
         }
         check_token_range(token_offset, shape.num_tokens as usize)?;
+        let TelemetryBuffer {
+            records,
+            counters,
+            tokens,
+            device_tokens,
+            ..
+        } = log;
         raw::launch_route_dispatch_log(
-            &self.stream,
+            stream,
             &self.dispatch_log_fn,
             raw::DispatchLaunch {
                 logits,
@@ -527,11 +618,12 @@ impl GpuRouter {
                 num_experts: shape.num_experts,
                 k: shape.k,
                 gate: gate.arg(),
+                token_base: device_tokens.then_some(&*tokens),
                 layer_id: layer_id as u32,
                 token_offset,
                 dispatch,
-                log: &mut log.records,
-                log_counters: &mut log.counters,
+                log: records,
+                log_counters: counters,
             },
         )?;
         Ok(())
@@ -579,6 +671,9 @@ pub struct TelemetryBuffer {
     /// `[append cursor, dropped]`. The cursor keeps counting past capacity,
     /// so `min(cursor, capacity)` is the number of valid records.
     counters: CudaSlice<u64>,
+    /// Device-side token counter, added to token ids when `device_tokens`.
+    tokens: CudaSlice<u64>,
+    device_tokens: bool,
 }
 
 impl TelemetryBuffer {
@@ -591,6 +686,8 @@ impl TelemetryBuffer {
         Ok(TelemetryBuffer {
             records: stream.alloc_zeros::<TelemetryRecord>(capacity)?,
             counters: stream.alloc_zeros::<u64>(2)?,
+            tokens: stream.alloc_zeros::<u64>(1)?,
+            device_tokens: false,
             stream,
         })
     }
@@ -600,13 +697,29 @@ impl TelemetryBuffer {
         self.records.len()
     }
 
+    /// Turns device-side token ids on or off. When on, every record's
+    /// `token_id` is `device counter + token_offset + token index`, and the
+    /// counter only moves via [`GpuRouter::advance_tokens`]. That keeps ids
+    /// correct when logging is replayed from a captured CUDA graph, where
+    /// host-side `token_offset` values are frozen at capture time.
+    pub fn set_device_token_ids(&mut self, on: bool) {
+        self.device_tokens = on;
+    }
+
+    /// Current value of the device token counter (synchronizes).
+    pub fn device_token_count(&self) -> Result<u64, GpuError> {
+        self.stream.context().synchronize()?;
+        Ok(self.stream.clone_dtoh(&self.tokens)?[0])
+    }
+
     /// Waits for all logging kernels, copies the valid records and the
     /// dropped count to host, and resets the log to empty.
     ///
     /// Transfers: one 16-byte copy of the counters, then one copy of exactly
     /// the valid prefix of the record buffer (not the whole capacity).
     pub fn drain(&mut self) -> Result<Drained, GpuError> {
-        self.stream.synchronize()?;
+        // Whole-context sync: logging may have run on other (borrowed) streams.
+        self.stream.context().synchronize()?;
         let counters = self.stream.clone_dtoh(&self.counters)?;
         let (cursor, dropped) = (counters[0], counters[1]);
         let valid = cursor.min(self.capacity() as u64) as usize;

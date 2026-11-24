@@ -4,7 +4,7 @@ per-domain expert specialisation, and save a figure.
 
     python examples/analyze_routing.py                       # Granite-3.1-1B-A400M (32 experts, top-8)
     python examples/analyze_routing.py --model allenai/OLMoE-1B-7B-0924
-    python examples/analyze_routing.py --model LiquidAI/LFM2-8B-A1B --load-4bit   # sigmoid + selection bias
+    python examples/analyze_routing.py --model LiquidAI/LFM2-8B-A1B --device-map auto   # sigmoid + bias, 2 GPUs
     python examples/analyze_routing.py --toy deepseek_v3     # tiny random model, offline smoke test
 
 Outputs (in --out, default ./routing_report/):
@@ -111,7 +111,8 @@ def build_model(args):
         dtype = torch.float32
     # device_map loads weights straight onto the GPU: OLMoE-1B-7B is ~14 GB in
     # fp16, more than a free Colab VM's RAM, but it fits a 16 GB T4.
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, device_map=args.device, **extra).eval()
+    device_map = args.device_map or args.device
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, device_map=device_map, **extra).eval()
     return model, tok
 
 
@@ -248,7 +249,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="ibm-granite/granite-3.1-1b-a400m-base")
     ap.add_argument("--toy", choices=["granitemoe", "olmoe", "mixtral", "deepseek_v3"], default="")
-    ap.add_argument("--load-4bit", action="store_true", help="bitsandbytes 4-bit weights (routers stay fp)")
+    ap.add_argument("--load-4bit", action="store_true",
+                    help="bitsandbytes 4-bit nn.Linear weights (routers stay fp32; fused MoE experts are not quantized)")
+    ap.add_argument("--device-map", default=None, help='e.g. "auto" to split a model over several GPUs')
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--repeat", type=int, default=8, help="passes over the domain texts (more tokens)")
     ap.add_argument("--out", default="routing_report")

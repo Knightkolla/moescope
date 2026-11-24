@@ -60,6 +60,19 @@ fn parse_mode(mode: &str) -> PyResult<GateMode> {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn parse_dtype(dtype: &str) -> PyResult<crate::gpu::LogitsDtype> {
+    use crate::gpu::LogitsDtype;
+    match dtype {
+        "float32" => Ok(LogitsDtype::F32),
+        "float16" => Ok(LogitsDtype::F16),
+        "bfloat16" => Ok(LogitsDtype::BF16),
+        other => Err(value_err(format!(
+            "dtype must be float32, float16 or bfloat16, got {other:?}"
+        ))),
+    }
+}
+
 fn mode_name(mode: GateMode) -> &'static str {
     match mode {
         GateMode::SoftmaxThenTopK => "softmax_topk",
@@ -221,7 +234,18 @@ impl Recorder {
     /// Sets (or replaces) layer `layer_id`'s per-expert selection bias, e.g.
     /// DeepSeek-V3's `e_score_correction_bias`. Sigmoid mode only. On the
     /// GPU backend the bias is copied to the device once and reused.
-    fn set_bias(&mut self, py: Python<'_>, layer_id: u16, bias: PyBuffer<f32>) -> PyResult<()> {
+    ///
+    /// `half=True`: the model keeps the bias in the same float16 / bfloat16
+    /// precision as its logits, so (GPU, half-precision logits) score + bias
+    /// is rounded to that precision before ranking, as torch does.
+    #[pyo3(signature = (layer_id, bias, half = false))]
+    fn set_bias(
+        &mut self,
+        py: Python<'_>,
+        layer_id: u16,
+        bias: PyBuffer<f32>,
+        half: bool,
+    ) -> PyResult<()> {
         if self.gating.mode != GateMode::Sigmoid {
             return Err(value_err("a selection bias needs mode 'sigmoid'"));
         }
@@ -234,11 +258,17 @@ impl Recorder {
         }
         match &mut self.backend {
             Backend::Cpu { biases, .. } => {
+                let _ = half; // host logits are float32: nothing to round
                 biases.insert(layer_id, host);
             }
             #[cfg(feature = "cuda")]
             Backend::Gpu { router, biases, .. } => {
-                let dev = router.upload_bias(&host).map_err(gpu_err)?;
+                let dev = if half {
+                    router.upload_bias_half(&host)
+                } else {
+                    router.upload_bias(&host)
+                }
+                .map_err(gpu_err)?;
                 biases.insert(layer_id, dev);
             }
         }
@@ -295,10 +325,15 @@ impl Recorder {
     }
 
     /// Zero-copy variant for logits already on the GPU: `ptr` is the device
-    /// address of a C-contiguous float32 `[num_tokens, num_experts]` tensor
-    /// (torch: `t.data_ptr()`). The pointer is validated with the CUDA
-    /// driver before use. GPU backend only.
-    #[pyo3(signature = (ptr, num_tokens, num_experts, k, layer_id, token_offset = 0))]
+    /// address of a C-contiguous `[num_tokens, num_experts]` tensor
+    /// (torch: `t.data_ptr()`) of `dtype` "float32", "float16" or
+    /// "bfloat16". `stream` is the raw CUDA stream to launch on (torch:
+    /// `torch.cuda.current_stream().cuda_stream`; 0 = legacy default), so no
+    /// host sync is needed and the launch can be captured in a CUDA graph.
+    /// The pointer and stream are validated with the CUDA driver before use.
+    /// GPU backend only.
+    #[pyo3(signature = (ptr, num_tokens, num_experts, k, layer_id, token_offset = 0,
+                        dtype = "float32", stream = 0))]
     #[allow(clippy::too_many_arguments)]
     fn route_and_log_device(
         &mut self,
@@ -309,6 +344,8 @@ impl Recorder {
         k: usize,
         layer_id: u16,
         token_offset: u32,
+        dtype: &str,
+        stream: u64,
     ) -> PyResult<()> {
         let gating = self.gating;
         match &mut self.backend {
@@ -321,6 +358,8 @@ impl Recorder {
                     k,
                     layer_id,
                     token_offset,
+                    dtype,
+                    stream,
                     gating,
                 );
                 Err(PyRuntimeError::new_err(
@@ -332,24 +371,57 @@ impl Recorder {
                 router,
                 log,
                 biases,
-            } => py.detach(move || {
-                let gate = GpuGate {
-                    gating,
-                    bias: biases.get(&layer_id),
-                };
-                router
-                    .log_only_device(
-                        ptr,
-                        num_tokens,
-                        num_experts,
-                        k,
-                        gate,
-                        layer_id,
-                        token_offset,
-                        log,
-                    )
-                    .map_err(gpu_err)
-            }),
+            } => {
+                let dtype = parse_dtype(dtype)?;
+                py.detach(move || {
+                    let gate = GpuGate {
+                        gating,
+                        bias: biases.get(&layer_id),
+                    };
+                    router
+                        .log_only_device(
+                            ptr,
+                            dtype,
+                            num_tokens,
+                            num_experts,
+                            k,
+                            gate,
+                            layer_id,
+                            token_offset,
+                            log,
+                            stream,
+                        )
+                        .map_err(gpu_err)
+                })
+            }
+        }
+    }
+
+    /// GPU backend: keep token ids in a device-side counter (moved only by
+    /// `advance_tokens`), so logging replayed from a CUDA graph gets fresh
+    /// ids each replay. No effect on the CPU backend, which always uses the
+    /// host `token_offset`.
+    fn set_device_token_ids(&mut self, on: bool) {
+        #[cfg(feature = "cuda")]
+        if let Backend::Gpu { log, .. } = &mut self.backend {
+            log.set_device_token_ids(on);
+        }
+        let _ = on;
+    }
+
+    /// GPU backend: adds `n` to the device token counter, launched on
+    /// `stream` (0 = legacy default). Call once per forward pass.
+    #[pyo3(signature = (n, stream = 0))]
+    fn advance_tokens(&mut self, n: u64, stream: u64) -> PyResult<()> {
+        match &mut self.backend {
+            Backend::Cpu { .. } => {
+                let _ = (n, stream);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            Backend::Gpu { router, log, .. } => {
+                router.advance_tokens(log, n, stream).map_err(gpu_err)
+            }
         }
     }
 

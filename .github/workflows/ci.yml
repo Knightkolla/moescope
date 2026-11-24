@@ -1,0 +1,46 @@
+# Every push and PR: formatting, lints, Rust tests (CPU; the GPU path is
+# compiled but its tests skip without a driver), and the Python test suite
+# including attach() parity against the real transformers routers.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --features python,cuda-12040 -- -D warnings
+      - run: cargo test
+      - run: cargo test --features cuda-12040
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install test dependencies (CPU torch)
+        run: |
+          python -m pip install --upgrade pip maturin pytest numpy
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install transformers
+      - name: Build and install moescope (CUDA backend compiled in, CPU used here)
+        run: |
+          maturin build --release -F python,pyo3/extension-module,cuda-12040 -o dist
+          python -m pip install dist/moescope-*.whl
+      - run: python -m pytest -q tests/python
