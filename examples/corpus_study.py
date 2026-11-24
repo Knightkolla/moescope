@@ -154,10 +154,13 @@ def main():
         print(f"data {d}: {data[d].numel():,} tokens in {time.time() - t0:.0f}s", flush=True)
     spec = moescope.routing_spec(model.config)
 
-    # --- prefill over the corpus: one log, chunk -> domain bookkeeping -----
+    # --- prefill over the corpus. The log is drained after every forward pass
+    # (it only has to hold one batch, so it fits next to a 14 GB model on a
+    # 16 GB GPU); token ids keep counting across drains.
     chunk_domain = []
     n_layers = len(moescope.hf.find_routers(model, spec.num_experts))
-    capacity = sum(len(c) for c in data.values()) * SEQ * n_layers * spec.k
+    capacity = args.batch * SEQ * n_layers * spec.k
+    parts, dropped = [], 0
     t0 = time.time()
     with moescope.attach(model, capacity=capacity) as session:
         with torch.no_grad():
@@ -166,8 +169,11 @@ def main():
                     batch = data[d][b : b + args.batch].to(in_device)
                     model(input_ids=batch)
                     chunk_domain += [di] * len(batch)
+                    part, lost = session.drain_with_stats()
+                    parts.append(part)
+                    dropped += lost
                 print(f"prefill {d} done ({time.time() - t0:.0f}s)", flush=True)
-        log, dropped = session.drain_with_stats()
+    log = np.concatenate(parts)
     t_prefill = time.time() - t0
     layer_ids = sorted(session.routers)
     L, E = len(layer_ids), spec.num_experts
