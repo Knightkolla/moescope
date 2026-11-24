@@ -6,8 +6,21 @@ build-backend = "maturin"
 name = "moescope"
 version = "0.1.0"
 description = "MoE routing telemetry: log every router decision on the GPU, drain once"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
+keywords = ["mixture-of-experts", "moe", "routing", "cuda", "telemetry", "interpretability"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
 dependencies = ["numpy>=1.21"]
+
+[project.urls]
+Repository = "https://github.com/Knightkolla/moescope"
 
 [project.optional-dependencies]
 torch = ["torch>=2.0"]

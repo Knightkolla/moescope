@@ -229,3 +229,7 @@ bash scripts/colab_models.sh              # GPU parity + stream/graph tests, str
 ```
 
 On a GPU machine, set `MOESCOPE_REQUIRE_GPU=1` so a missing driver fails the tests instead of skipping them.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
