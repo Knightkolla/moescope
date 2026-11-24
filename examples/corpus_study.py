@@ -221,39 +221,52 @@ def main():
     split = chunk < half
     floor_js = [js_bits(usage(log[split & (pos >= 256)], L, E)[l], usage(log[~split & (pos >= 256)], L, E)[l]) for l in range(L)]
 
-    # 4) generation drift: routing of generated tokens, first vs last quarter
-    drift = None
-    if args.gen_tokens > 0 and not args.toy:
-        print(f"generating {args.gen_tokens} tokens x 8 prompts", flush=True)
-        prompts = torch.cat([data[d][:2, :128] for d in domains]).to(in_device)  # 8 prompts, 2 per domain
-        gen_cap = (prompts.numel() + args.gen_tokens * len(prompts)) * n_layers * spec.k
-        with moescope.attach(model, capacity=gen_cap) as gen:
-            with torch.no_grad():
-                model.generate(prompts, max_new_tokens=args.gen_tokens, min_new_tokens=args.gen_tokens, do_sample=False,
-                               pad_token_id=tok.eos_token_id)
-            glog = gen.drain()
-        glog = glog.copy()
-        glog["layer_id"] = np.searchsorted(layer_ids, glog["layer_id"])
-        gen_ids = glog["token_id"] - prompts.numel()  # decode tokens only (prefill first)
-        step = gen_ids // len(prompts)
-        g = glog[gen_ids >= 0]
-        step = step[gen_ids >= 0]
-        q = args.gen_tokens // 4
-        first, last = usage(g[step < q], L, E), usage(g[step >= 3 * q], L, E)
-        drift = {"js_first_vs_last_quarter_per_layer": [js_bits(first[l], last[l]) for l in range(L)],
-                 "prefill_vs_generated_js_per_layer": [js_bits(all_usage[l], usage(g, L, E)[l]) for l in range(L)]}
-
     result = {
         "model": name, "tokens_per_domain": {d: int(len(data[d]) * SEQ) for d in domains},
         "decisions": int(len(log)), "dropped": int(dropped), "moe_layer_ids": layer_ids, "experts": E, "k": spec.k,
         "top8_overlap_mean_ci": overlap, "top8_overlap_per_layer": per_layer_overlap,
         "imbalance_per_layer": imbalance, "imbalance_mean_ci": imb_ci, "idle_experts_per_layer": idle,
         "position_js_early_vs_late_per_layer": pos_js, "position_js_noise_floor_per_layer": floor_js,
-        "generation_drift": drift,
+        "generation_drift": None,
     }
-    with open(os.path.join(args.out, "study.json"), "w") as f:
-        json.dump(result, f, indent=1)
-    plot(result, domains, os.path.join(args.out, "study.png"))
+
+    def save():
+        with open(os.path.join(args.out, "study.json"), "w") as f:
+            json.dump(result, f, indent=1)
+        plot(result, domains, os.path.join(args.out, "study.png"))
+
+    save()  # prefill results are kept even if generation fails
+    del log, parts, per_chunk
+
+    # 4) generation drift: routing of generated tokens, first vs last quarter.
+    # One prompt at a time (2 per domain) keeps generate()'s memory small.
+    if args.gen_tokens > 0 and not args.toy:
+        print(f"generating {args.gen_tokens} tokens x 8 prompts", flush=True)
+        torch.cuda.empty_cache()
+        prompts = [data[d][i : i + 1, :128] for d in domains for i in range(2)]
+        gen_cap = (128 + args.gen_tokens) * n_layers * spec.k
+        first = np.zeros((L, E))
+        last = np.zeros((L, E))
+        gen_all = np.zeros((L, E))
+        q = args.gen_tokens // 4
+        with moescope.attach(model, capacity=gen_cap) as gen:
+            for prompt in prompts:
+                start = gen.offset
+                with torch.no_grad():
+                    model.generate(prompt.to(in_device), max_new_tokens=args.gen_tokens, min_new_tokens=args.gen_tokens,
+                                   do_sample=False, pad_token_id=tok.eos_token_id)
+                glog = gen.drain().copy()
+                glog["layer_id"] = np.searchsorted(layer_ids, glog["layer_id"])
+                step = glog["token_id"].astype(np.int64) - start - prompt.shape[1]  # decode step (prefill < 0)
+                first += counts(glog[(step >= 0) & (step < q)], L, E)
+                last += counts(glog[step >= 3 * q], L, E)
+                gen_all += counts(glog[step >= 0], L, E)
+        first, last, gen_all = normalize(first), normalize(last), normalize(gen_all)
+        result["generation_drift"] = {
+            "js_first_vs_last_quarter_per_layer": [js_bits(first[l], last[l]) for l in range(L)],
+            "prefill_vs_generated_js_per_layer": [js_bits(all_usage[l], gen_all[l]) for l in range(L)],
+        }
+        save()
     print(json.dumps({k: v for k, v in result.items() if "per_layer" not in k}, indent=1))
 
 
