@@ -147,7 +147,11 @@ def main():
     in_device = model.get_input_embeddings().weight.device
 
     domains = ["code", "maths", "english", "french"]
-    data = {d: (toy_chunks(d, args.tokens, vocab) if args.toy else chunks_for(tok, d, args.tokens, vocab)) for d in domains}
+    data = {}
+    for d in domains:
+        t0 = time.time()
+        data[d] = toy_chunks(d, args.tokens, vocab) if args.toy else chunks_for(tok, d, args.tokens, vocab)
+        print(f"data {d}: {data[d].numel():,} tokens in {time.time() - t0:.0f}s", flush=True)
     spec = moescope.routing_spec(model.config)
 
     # --- prefill over the corpus: one log, chunk -> domain bookkeeping -----
@@ -162,6 +166,7 @@ def main():
                     batch = data[d][b : b + args.batch].to(in_device)
                     model(input_ids=batch)
                     chunk_domain += [di] * len(batch)
+                print(f"prefill {d} done ({time.time() - t0:.0f}s)", flush=True)
         log, dropped = session.drain_with_stats()
     t_prefill = time.time() - t0
     layer_ids = sorted(session.routers)
@@ -212,6 +217,7 @@ def main():
     # 4) generation drift: routing of generated tokens, first vs last quarter
     drift = None
     if args.gen_tokens > 0 and not args.toy:
+        print(f"generating {args.gen_tokens} tokens x 8 prompts", flush=True)
         prompts = torch.cat([data[d][:2, :128] for d in domains]).to(in_device)  # 8 prompts, 2 per domain
         gen_cap = (prompts.numel() + args.gen_tokens * len(prompts)) * n_layers * spec.k
         with moescope.attach(model, capacity=gen_cap) as gen:
