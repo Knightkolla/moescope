@@ -21,11 +21,11 @@ use cudarc::driver::sys::{
     CUdeviceptr, CUpointer_attribute, cuMemGetAddressRange_v2, cuPointerGetAttribute,
 };
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
-    ValidAsZeroBits,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig,
+    PushKernelArg, ValidAsZeroBits,
 };
 
-use crate::router::Route;
+use crate::router::{GateMode, Gating, Route};
 use crate::telemetry::TelemetryRecord;
 
 // SAFETY: `TelemetryRecord` is `#[repr(C)]` { u32, u16, u16, f32 } = 12 bytes,
@@ -40,6 +40,84 @@ unsafe impl ValidAsZeroBits for TelemetryRecord {}
 unsafe impl DeviceRepr for Route {}
 // SAFETY: all-zero bits are a valid `Route` (expert 0, gate 0.0).
 unsafe impl ValidAsZeroBits for Route {}
+
+/// Kernel-side gating parameters, passed by value. Mirrors `GateParams` in
+/// the CUDA source: { int, uint, uint, int, float, uint, const float* },
+/// 32 bytes, the pointer 8-byte aligned at offset 24.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GateParams {
+    mode: i32,
+    num_groups: u32,
+    top_groups: u32,
+    normalize: i32,
+    scale: f32,
+    pad: u32,
+    bias: CUdeviceptr,
+}
+const _: () = assert!(std::mem::size_of::<GateParams>() == 32);
+
+// SAFETY: `GateParams` is `#[repr(C)]` plain data (integers, a float and a
+// device address) with the same layout as the CUDA struct (size asserted).
+unsafe impl DeviceRepr for GateParams {}
+
+/// Gating for one launch: the configuration plus an optional per-expert
+/// selection bias already on the device (validated by the caller to be
+/// `num_experts` long and only used in sigmoid mode).
+#[derive(Clone, Copy)]
+pub(super) struct GateArg<'a> {
+    pub gating: Gating,
+    pub bias: Option<&'a CudaSlice<f32>>,
+}
+
+impl GateArg<'_> {
+    /// Asserts the invariants the kernel relies on.
+    fn check(&self, num_experts: usize) {
+        if let Some(b) = self.bias {
+            assert_eq!(b.len(), num_experts, "bias length");
+            assert_eq!(self.gating.mode, GateMode::Sigmoid);
+        }
+        if let Some(g) = self.gating.groups {
+            assert!(g.num_groups >= 1 && g.num_groups <= crate::router::MAX_GROUPS);
+            assert!(num_experts.is_multiple_of(g.num_groups));
+            assert!(g.top_groups >= 1 && g.top_groups <= g.num_groups);
+        }
+    }
+}
+
+/// Pushes `gate` as the kernel's `GateParams` argument. The returned guard
+/// (cudarc's stream-ordering hook for the bias buffer) must outlive the
+/// launch, so the caller keeps it until after `launch`.
+fn push_gate<'a>(
+    stream: &'a CudaStream,
+    gate: GateArg<'a>,
+) -> (GateParams, Option<cudarc::driver::SyncOnDrop<'a>>) {
+    let (bias, guard) = match gate.bias {
+        Some(b) => {
+            let (ptr, guard) = b.device_ptr(stream);
+            (ptr, Some(guard))
+        }
+        None => (0, None),
+    };
+    let g = gate.gating;
+    let (num_groups, top_groups) = g
+        .groups
+        .map_or((1, 1), |x| (x.num_groups as u32, x.top_groups as u32));
+    let params = GateParams {
+        mode: match g.mode {
+            GateMode::SoftmaxThenTopK => 0,
+            GateMode::TopKThenSoftmax => 1,
+            GateMode::Sigmoid => 2,
+        },
+        num_groups,
+        top_groups,
+        normalize: g.normalize as i32,
+        scale: g.scale,
+        pad: 0,
+        bias,
+    };
+    (params, guard)
+}
 
 /// Threads per block. A block holds `BLOCK / lanes` tokens; every lane keeps
 /// two MAX_K arrays, so a modest block size keeps register pressure sane.
@@ -72,24 +150,28 @@ pub(super) fn launch_route(
     num_tokens: u32,
     num_experts: u32,
     k: u32,
-    mode: i32,
+    gate: GateArg<'_>,
     out: &mut CudaSlice<Route>,
 ) -> Result<(), cudarc::driver::DriverError> {
     assert_eq!(logits.len(), num_tokens as usize * num_experts as usize);
     assert_eq!(out.len(), num_tokens as usize * k as usize);
     assert!(k >= 1 && k as usize <= super::kernels::MAX_K && num_tokens > 0);
+    gate.check(num_experts as usize);
     let lanes = super::kernels::lanes_per_token(num_experts);
+    let (params, _bias_guard) = push_gate(stream, gate);
     let mut launch = stream.launch_builder(func);
     launch
         .arg(logits)
         .arg(&num_tokens)
         .arg(&num_experts)
         .arg(&k)
-        .arg(&mode)
+        .arg(&params)
         .arg(out)
         .arg(&lanes);
     // SAFETY: argument order and types match the kernel signature
-    // (const float*, uint, uint, uint, int, RouteEntry*, uint). The lanes of
+    // (const float*, uint, uint, uint, GateParams, RouteEntry*, uint).
+    // GateParams.bias is null or a live device buffer of exactly E floats
+    // (gate.check), read only at indices < E. The lanes of
     // token t read logits[t*E .. t*E+E) and write out[t*k .. t*k+k) only for
     // t < num_tokens, which the length asserts above keep in bounds; k <= MAX_K
     // keeps the per-lane arrays in bounds; lanes is a power of two <= 32 that
@@ -215,7 +297,7 @@ pub(super) struct DispatchLaunch<'a> {
     pub num_tokens: u32,
     pub num_experts: u32,
     pub k: u32,
-    pub mode: i32,
+    pub gate: GateArg<'a>,
     pub layer_id: u32,
     pub token_offset: u32,
     /// `None` = telemetry-only: the kernel skips routes/dispatch entirely.
@@ -254,6 +336,8 @@ pub(super) fn launch_route_dispatch_log(
     assert!(p.token_offset as u64 + n as u64 <= u32::MAX as u64 + 1);
     let capacity = p.log.len() as u64;
     let lanes = super::kernels::lanes_per_token(p.num_experts);
+    p.gate.check(e);
+    let (params, _bias_guard) = push_gate(stream, p.gate);
 
     let mut launch = stream.launch_builder(func);
     let foreign_ptr: CUdeviceptr;
@@ -269,7 +353,7 @@ pub(super) fn launch_route_dispatch_log(
         .arg(&p.num_tokens)
         .arg(&p.num_experts)
         .arg(&p.k)
-        .arg(&p.mode)
+        .arg(&params)
         .arg(&p.layer_id)
         .arg(&p.token_offset);
     // Null device pointers for the unused dispatch outputs in telemetry-only mode.
@@ -286,7 +370,7 @@ pub(super) fn launch_route_dispatch_log(
         .arg(&write_dispatch)
         .arg(&lanes);
     // SAFETY: argument order and types match the kernel signature
-    // (const float*, uint x6 [one is int mode], RouteEntry*, uint*, uint*,
+    // (const float*, uint x3, GateParams, uint x2, RouteEntry*, uint*, uint*,
     // TelemetryRecord*, unsigned long long, unsigned long long*, int, uint
     // lanes: a power of two <= 32 dividing the block, so groups never
     // straddle a warp and every warp is full for the shuffles). When
@@ -302,6 +386,8 @@ pub(super) fn launch_route_dispatch_log(
     // * expert ids are < E, so expert_counts[e] is in bounds, and the slot
     //   returned is < n (counts were zeroed and each token hits e at most
     //   once), so gathered[e*n + slot] < E*n is in bounds;
+    // * GateParams.bias is null or a live device buffer of exactly E floats
+    //   (gate.check), read only at expert indices < E;
     // * log is written only at idx < capacity == log.len();
     // * log_counters has exactly the 2 elements the kernel touches.
     // All flat indices fit in u32 (checked by the caller), so none wrap.

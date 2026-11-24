@@ -28,12 +28,15 @@ from ._native import Recorder, built_with_cuda, cuda_available
 __all__ = [
     "RECORD_DTYPE",
     "Recorder",
+    "attach",
     "built_with_cuda",
     "configure",
     "cuda_available",
     "drain",
     "drain_with_stats",
     "route_and_log",
+    "routing_spec",
+    "set_bias",
 ]
 
 #: One row per routing decision; byte-identical to the Rust/CUDA struct.
@@ -45,18 +48,51 @@ assert RECORD_DTYPE.itemsize == _native.RECORD_ITEMSIZE == 12
 _default: Optional[Recorder] = None
 
 
-def configure(capacity: int = 1 << 22, mode: str = "softmax_topk", device: str = "auto") -> Recorder:
+def configure(
+    capacity: int = 1 << 22,
+    mode: str = "softmax_topk",
+    device: str = "auto",
+    *,
+    normalize: bool = False,
+    scale: float = 1.0,
+    n_group: int = 1,
+    topk_group: int = 1,
+) -> Recorder:
     """(Re)create the default recorder.
 
     capacity: max records held between drains (12 bytes each). Records past
         this are counted as dropped, never silently lost.
     mode: "softmax_topk" (softmax over all experts, keep top-k probs; OLMoE,
-        Switch) or "topk_softmax" (softmax over the selected k; Mixtral).
+        Qwen-MoE without norm_topk_prob), "topk_softmax" (softmax over the
+        selected k; Mixtral, Granite) or "sigmoid" (DeepSeek-V3, GLM-4.5,
+        Kimi K2, Llama 4).
     device: "auto", "cpu", "cuda" or "cuda:N".
+    normalize: divide the k gates by their sum (``norm_topk_prob``).
+    scale: multiply the gates (``routed_scaling_factor``).
+    n_group, topk_group: DeepSeek-V3 group-limited routing (sigmoid only).
+
+    For Hugging Face models, :func:`attach` sets all of this from the config.
     """
     global _default
-    _default = Recorder(capacity=capacity, mode=mode, device=device)
+    _default = Recorder(
+        capacity=capacity,
+        mode=mode,
+        device=device,
+        normalize=normalize,
+        scale=scale,
+        n_group=n_group,
+        topk_group=topk_group,
+    )
     return _default
+
+
+def set_bias(layer_id: int, bias: Any, recorder: Optional[Recorder] = None) -> None:
+    """Sets layer ``layer_id``'s per-expert selection bias (sigmoid mode),
+    e.g. DeepSeek-V3's ``e_score_correction_bias``. Copied once; reused for
+    every later call on that layer."""
+    if _is_torch_tensor(bias):
+        bias = bias.detach().float().cpu().numpy()
+    _recorder(recorder).set_bias(layer_id, np.ascontiguousarray(bias, dtype=np.float32))
 
 
 def _recorder(recorder: Optional[Recorder]) -> Recorder:
@@ -128,3 +164,6 @@ def drain(recorder: Optional[Recorder] = None) -> np.ndarray:
             stacklevel=2,
         )
     return records
+
+
+from .hf import attach, routing_spec  # noqa: E402  (needs the names above)

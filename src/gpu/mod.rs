@@ -11,7 +11,7 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStrea
 use cudarc::nvrtc::{CompileError, CompileOptions, compile_ptx_with_opts};
 
 use crate::dispatcher::DispatchPlan;
-use crate::router::{GateMode, Route, RouteError, check_shape, validate_batch};
+use crate::router::{GateMode, Gating, Route, RouteError, check_shape, validate_batch};
 use crate::telemetry::{Drained, TelemetryError, TelemetryRecord, check_token_range};
 
 /// Anything that can go wrong on the GPU path.
@@ -120,11 +120,73 @@ fn copy_prefix<T: cudarc::driver::DeviceRepr>(
     Ok(stream.clone_dtoh(&buf.slice(0..len))?)
 }
 
-/// Kernel argument encoding of [`GateMode`] (must match `compute_gates`).
-fn mode_code(mode: GateMode) -> i32 {
-    match mode {
-        GateMode::SoftmaxThenTopK => 0,
-        GateMode::TopKThenSoftmax => 1,
+/// A per-expert selection bias held on the GPU (sigmoid mode; DeepSeek-V3's
+/// `e_score_correction_bias`). Upload once per layer with
+/// [`GpuRouter::upload_bias`] and reuse it for every batch.
+pub struct DeviceBias {
+    buf: CudaSlice<f32>,
+}
+
+impl DeviceBias {
+    /// Number of experts this bias covers.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Always false (a bias covers at least one expert).
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
+/// Gating for one GPU call: a [`Gating`] configuration plus an optional
+/// device-resident selection bias. A bare [`GateMode`] or [`Gating`]
+/// converts into this, so simple callers never name it.
+#[derive(Clone, Copy)]
+pub struct GpuGate<'a> {
+    pub gating: Gating,
+    pub bias: Option<&'a DeviceBias>,
+}
+
+impl From<GateMode> for GpuGate<'_> {
+    fn from(mode: GateMode) -> Self {
+        Gating::from(mode).into()
+    }
+}
+
+impl From<Gating> for GpuGate<'_> {
+    fn from(gating: Gating) -> Self {
+        GpuGate { gating, bias: None }
+    }
+}
+
+impl<'a> GpuGate<'a> {
+    /// The same configuration checks as the CPU router.
+    fn validate(&self, num_experts: usize, k: usize) -> Result<(), GpuError> {
+        self.gating.validate(num_experts, k, None)?;
+        if let Some(b) = self.bias {
+            if self.gating.mode != GateMode::Sigmoid {
+                return Err(RouteError::InvalidGating(
+                    "a selection bias needs mode 'sigmoid'".into(),
+                )
+                .into());
+            }
+            if b.len() != num_experts {
+                return Err(RouteError::InvalidGating(format!(
+                    "bias has {} entries, layer has {num_experts} experts",
+                    b.len()
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn arg(&self) -> raw::GateArg<'a> {
+        raw::GateArg {
+            gating: self.gating,
+            bias: self.bias.map(|b| &b.buf),
+        }
     }
 }
 
@@ -191,17 +253,37 @@ impl GpuRouter {
         })
     }
 
+    /// Copies a per-expert selection bias to the GPU once, for reuse with
+    /// every batch of that layer (see [`GpuGate`]). Values must be finite.
+    pub fn upload_bias(&self, bias: &[f32]) -> Result<DeviceBias, GpuError> {
+        if bias.is_empty() {
+            return Err(RouteError::InvalidGating("bias is empty".into()).into());
+        }
+        if let Some(i) = bias.iter().position(|x| !x.is_finite()) {
+            return Err(RouteError::InvalidGating(format!(
+                "bias[{i}] = {} is not finite",
+                bias[i]
+            ))
+            .into());
+        }
+        Ok(DeviceBias {
+            buf: self.stream.clone_htod(bias)?,
+        })
+    }
+
     /// Routes a `[num_tokens, num_experts]` batch on the GPU and copies the
     /// result back. Same contract and `[token * k + j]` layout as
     /// [`crate::router::route_batch`]; that function is its test oracle.
-    pub fn route(
+    pub fn route<'g>(
         &self,
         logits: &[f32],
         num_experts: usize,
         k: usize,
-        mode: GateMode,
+        gate: impl Into<GpuGate<'g>>,
     ) -> Result<Vec<Route>, GpuError> {
+        let gate = gate.into();
         let shape = validate_for_gpu(logits, num_experts, k)?;
+        gate.validate(num_experts, k)?;
         if shape.num_tokens == 0 {
             return Ok(Vec::new());
         }
@@ -216,7 +298,7 @@ impl GpuRouter {
             shape.num_tokens,
             shape.num_experts,
             shape.k,
-            mode_code(mode),
+            gate.arg(),
             &mut out,
         )?;
         Ok(self.stream.clone_dtoh(&out)?)
@@ -234,17 +316,19 @@ impl GpuRouter {
     /// index so successive batches get distinct `token_id`s. Logits are
     /// validated exactly like the CPU router (shape, finite).
     #[allow(clippy::too_many_arguments)]
-    pub fn route_dispatch_log(
+    pub fn route_dispatch_log<'g>(
         &self,
         logits: &[f32],
         num_experts: usize,
         k: usize,
-        mode: GateMode,
+        gate: impl Into<GpuGate<'g>>,
         layer_id: u16,
         token_offset: u32,
         log: &mut TelemetryBuffer,
     ) -> Result<DeviceDispatch, GpuError> {
+        let gate = gate.into();
         let shape = validate_for_gpu(logits, num_experts, k)?;
+        gate.validate(num_experts, k)?;
         if shape.num_tokens == 0 {
             return self.empty_dispatch(num_experts);
         }
@@ -252,7 +336,7 @@ impl GpuRouter {
         self.launch_dispatch(
             raw::LogitsArg::Owned(&logits_dev),
             shape,
-            mode,
+            gate,
             layer_id,
             token_offset,
             log,
@@ -272,18 +356,20 @@ impl GpuRouter {
     /// and not overwritten until it finishes. Logits are not checked for
     /// NaN here (that would need a device read); the kernel ranks NaN as -inf.
     #[allow(clippy::too_many_arguments)]
-    pub fn route_dispatch_log_device(
+    pub fn route_dispatch_log_device<'g>(
         &self,
         logits_ptr: u64,
         num_tokens: usize,
         num_experts: usize,
         k: usize,
-        mode: GateMode,
+        gate: impl Into<GpuGate<'g>>,
         layer_id: u16,
         token_offset: u32,
         log: &mut TelemetryBuffer,
     ) -> Result<DeviceDispatch, GpuError> {
+        let gate = gate.into();
         let shape = validate_shape_for_gpu(num_tokens, num_experts, k)?;
+        gate.validate(num_experts, k)?;
         if num_tokens == 0 {
             return self.empty_dispatch(num_experts);
         }
@@ -293,7 +379,7 @@ impl GpuRouter {
         self.launch_dispatch(
             raw::LogitsArg::Foreign(foreign),
             shape,
-            mode,
+            gate,
             layer_id,
             token_offset,
             log,
@@ -318,23 +404,25 @@ impl GpuRouter {
     /// but nothing except the log is written. No per-call allocations, one
     /// kernel launch. Use this when you only want the routing record.
     #[allow(clippy::too_many_arguments)]
-    pub fn log_only(
+    pub fn log_only<'g>(
         &self,
         logits: &[f32],
         num_experts: usize,
         k: usize,
-        mode: GateMode,
+        gate: impl Into<GpuGate<'g>>,
         layer_id: u16,
         token_offset: u32,
         log: &mut TelemetryBuffer,
     ) -> Result<(), GpuError> {
+        let gate = gate.into();
         let shape = validate_for_gpu(logits, num_experts, k)?;
+        gate.validate(num_experts, k)?;
         if shape.num_tokens == 0 {
             return Ok(());
         }
         let logits_dev = self.stream.clone_htod(logits)?;
         let logits = raw::LogitsArg::Owned(&logits_dev);
-        self.launch(logits, shape, mode, layer_id, token_offset, log, None)
+        self.launch(logits, shape, gate, layer_id, token_offset, log, None)
     }
 
     /// Zero-copy [`log_only`](Self::log_only) for logits already on the GPU
@@ -343,18 +431,20 @@ impl GpuRouter {
     /// is what the Python `route_and_log` uses for CUDA tensors: one pointer
     /// check plus one kernel launch per call.
     #[allow(clippy::too_many_arguments)]
-    pub fn log_only_device(
+    pub fn log_only_device<'g>(
         &self,
         logits_ptr: u64,
         num_tokens: usize,
         num_experts: usize,
         k: usize,
-        mode: GateMode,
+        gate: impl Into<GpuGate<'g>>,
         layer_id: u16,
         token_offset: u32,
         log: &mut TelemetryBuffer,
     ) -> Result<(), GpuError> {
+        let gate = gate.into();
         let shape = validate_shape_for_gpu(num_tokens, num_experts, k)?;
+        gate.validate(num_experts, k)?;
         if num_tokens == 0 {
             return Ok(());
         }
@@ -362,7 +452,7 @@ impl GpuRouter {
             raw::borrow_foreign_f32(self.stream.context(), logits_ptr, num_tokens * num_experts)?
                 .map_err(GpuError::ForeignPtr)?;
         let logits = raw::LogitsArg::Foreign(foreign);
-        self.launch(logits, shape, mode, layer_id, token_offset, log, None)
+        self.launch(logits, shape, gate, layer_id, token_offset, log, None)
     }
 
     /// Shared tail of the dispatch entry points: allocate the per-call
@@ -371,7 +461,7 @@ impl GpuRouter {
         &self,
         logits: raw::LogitsArg<'_>,
         shape: BatchShape,
-        mode: GateMode,
+        gate: GpuGate<'_>,
         layer_id: u16,
         token_offset: u32,
         log: &mut TelemetryBuffer,
@@ -399,7 +489,7 @@ impl GpuRouter {
         self.launch(
             logits,
             shape,
-            mode,
+            gate,
             layer_id,
             token_offset,
             log,
@@ -415,7 +505,7 @@ impl GpuRouter {
         &self,
         logits: raw::LogitsArg<'_>,
         shape: BatchShape,
-        mode: GateMode,
+        gate: GpuGate<'_>,
         layer_id: u16,
         token_offset: u32,
         log: &mut TelemetryBuffer,
@@ -436,7 +526,7 @@ impl GpuRouter {
                 num_tokens: shape.num_tokens,
                 num_experts: shape.num_experts,
                 k: shape.k,
-                mode: mode_code(mode),
+                gate: gate.arg(),
                 layer_id: layer_id as u32,
                 token_offset,
                 dispatch,

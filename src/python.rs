@@ -10,21 +10,27 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::router::{GateMode, route_batch};
+use std::collections::HashMap;
+
+use crate::router::{GateMode, Gating, GroupLimit, route_batch_with};
 use crate::telemetry::{Drained, HostTelemetry, TelemetryRecord};
 
 #[cfg(feature = "cuda")]
-use crate::gpu::{GpuError, GpuRouter, TelemetryBuffer};
+use crate::gpu::{DeviceBias, GpuError, GpuGate, GpuRouter, TelemetryBuffer};
 
 /// Where routing runs and where the log lives.
 enum Backend {
     /// Reference router + bounded host log. Always available.
-    Cpu(HostTelemetry),
+    Cpu {
+        log: HostTelemetry,
+        biases: HashMap<u16, Vec<f32>>,
+    },
     /// Fused CUDA kernel + device-resident log.
     #[cfg(feature = "cuda")]
     Gpu {
         router: GpuRouter,
         log: TelemetryBuffer,
+        biases: HashMap<u16, DeviceBias>,
     },
 }
 
@@ -47,15 +53,29 @@ fn parse_mode(mode: &str) -> PyResult<GateMode> {
     match mode {
         "softmax_topk" => Ok(GateMode::SoftmaxThenTopK),
         "topk_softmax" => Ok(GateMode::TopKThenSoftmax),
+        "sigmoid" => Ok(GateMode::Sigmoid),
         other => Err(value_err(format!(
-            "mode must be 'softmax_topk' or 'topk_softmax', got {other:?}"
+            "mode must be 'softmax_topk', 'topk_softmax' or 'sigmoid', got {other:?}"
         ))),
+    }
+}
+
+fn mode_name(mode: GateMode) -> &'static str {
+    match mode {
+        GateMode::SoftmaxThenTopK => "softmax_topk",
+        GateMode::TopKThenSoftmax => "topk_softmax",
+        GateMode::Sigmoid => "sigmoid",
     }
 }
 
 /// `"cpu"`, `"cuda"`, `"cuda:N"` or `"auto"` (GPU 0 if available, else CPU).
 fn open_backend(device: &str, capacity: usize) -> PyResult<Backend> {
-    let cpu = || Ok(Backend::Cpu(HostTelemetry::new(capacity)));
+    let cpu = || {
+        Ok(Backend::Cpu {
+            log: HostTelemetry::new(capacity),
+            biases: HashMap::new(),
+        })
+    };
     let ordinal = match device {
         "cpu" => return cpu(),
         "auto" if !native_cuda_available() => return cpu(),
@@ -75,7 +95,11 @@ fn open_backend(device: &str, capacity: usize) -> PyResult<Backend> {
 fn open_gpu(ordinal: usize, capacity: usize) -> PyResult<Backend> {
     let router = GpuRouter::new(ordinal).map_err(gpu_err)?;
     let log = TelemetryBuffer::new(&router, capacity).map_err(gpu_err)?;
-    Ok(Backend::Gpu { router, log })
+    Ok(Backend::Gpu {
+        router,
+        log,
+        biases: HashMap::new(),
+    })
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -110,21 +134,50 @@ fn records_to_bytes(records: &[TelemetryRecord]) -> Vec<u8> {
 #[pyclass(module = "moescope._native", unsendable)]
 pub struct Recorder {
     backend: Backend,
-    mode: GateMode,
+    gating: Gating,
     capacity: usize,
 }
 
 #[pymethods]
 impl Recorder {
+    /// `mode`: "softmax_topk", "topk_softmax" or "sigmoid". `normalize`
+    /// divides the k gates by their sum, `scale` multiplies them, and
+    /// `n_group` / `topk_group` turn on DeepSeek-V3-style group-limited
+    /// routing (sigmoid mode only).
     #[new]
-    #[pyo3(signature = (capacity = 1 << 22, mode = "softmax_topk", device = "auto"))]
-    fn new(capacity: usize, mode: &str, device: &str) -> PyResult<Self> {
+    #[pyo3(signature = (capacity = 1 << 22, mode = "softmax_topk", device = "auto",
+                        normalize = false, scale = 1.0, n_group = 1, topk_group = 1))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        capacity: usize,
+        mode: &str,
+        device: &str,
+        normalize: bool,
+        scale: f32,
+        n_group: usize,
+        topk_group: usize,
+    ) -> PyResult<Self> {
         if capacity == 0 {
             return Err(value_err("capacity must be >= 1"));
         }
+        let gating = Gating {
+            mode: parse_mode(mode)?,
+            normalize,
+            scale,
+            groups: (n_group > 1 || topk_group > 1).then_some(GroupLimit {
+                num_groups: n_group,
+                top_groups: topk_group,
+            }),
+        };
+        if !scale.is_finite() {
+            return Err(value_err(format!("scale must be finite, got {scale}")));
+        }
+        if gating.groups.is_some() && gating.mode != GateMode::Sigmoid {
+            return Err(value_err("n_group / topk_group need mode 'sigmoid'"));
+        }
         Ok(Recorder {
             backend: open_backend(device, capacity)?,
-            mode: parse_mode(mode)?,
+            gating,
             capacity,
         })
     }
@@ -133,7 +186,7 @@ impl Recorder {
     #[getter]
     fn backend(&self) -> &'static str {
         match self.backend {
-            Backend::Cpu(_) => "cpu",
+            Backend::Cpu { .. } => "cpu",
             #[cfg(feature = "cuda")]
             Backend::Gpu { .. } => "cuda",
         }
@@ -146,10 +199,50 @@ impl Recorder {
 
     #[getter]
     fn mode(&self) -> &'static str {
-        match self.mode {
-            GateMode::SoftmaxThenTopK => "softmax_topk",
-            GateMode::TopKThenSoftmax => "topk_softmax",
+        mode_name(self.gating.mode)
+    }
+
+    /// The gating options as a tuple (mode, normalize, scale, n_group, topk_group).
+    #[getter]
+    fn gating(&self) -> (String, bool, f32, usize, usize) {
+        let (n, t) = self
+            .gating
+            .groups
+            .map_or((1, 1), |g| (g.num_groups, g.top_groups));
+        (
+            mode_name(self.gating.mode).to_string(),
+            self.gating.normalize,
+            self.gating.scale,
+            n,
+            t,
+        )
+    }
+
+    /// Sets (or replaces) layer `layer_id`'s per-expert selection bias, e.g.
+    /// DeepSeek-V3's `e_score_correction_bias`. Sigmoid mode only. On the
+    /// GPU backend the bias is copied to the device once and reused.
+    fn set_bias(&mut self, py: Python<'_>, layer_id: u16, bias: PyBuffer<f32>) -> PyResult<()> {
+        if self.gating.mode != GateMode::Sigmoid {
+            return Err(value_err("a selection bias needs mode 'sigmoid'"));
         }
+        let host = bias.to_vec(py)?;
+        if host.is_empty() {
+            return Err(value_err("bias is empty"));
+        }
+        if let Some(i) = host.iter().position(|x| !x.is_finite()) {
+            return Err(value_err(format!("bias[{i}] = {} is not finite", host[i])));
+        }
+        match &mut self.backend {
+            Backend::Cpu { biases, .. } => {
+                biases.insert(layer_id, host);
+            }
+            #[cfg(feature = "cuda")]
+            Backend::Gpu { router, biases, .. } => {
+                let dev = router.upload_bias(&host).map_err(gpu_err)?;
+                biases.insert(layer_id, dev);
+            }
+        }
+        Ok(())
     }
 
     /// Routes host logits (any C-contiguous float32 buffer of shape
@@ -174,18 +267,30 @@ impl Recorder {
         }
         let host = logits.to_vec(py)?;
         debug_assert_eq!(host.len(), num_tokens * num_experts);
-        let mode = self.mode;
+        let gating = self.gating;
         let backend = &mut self.backend;
         py.detach(move || match backend {
-            Backend::Cpu(log) => {
-                let routes = route_batch(&host, num_experts, k, mode).map_err(value_err)?;
+            Backend::Cpu { log, biases } => {
+                let bias = biases.get(&layer_id).map(Vec::as_slice);
+                let routes =
+                    route_batch_with(&host, num_experts, k, &gating, bias).map_err(value_err)?;
                 log.log_routes(&routes, k, layer_id, token_offset)
                     .map_err(value_err)
             }
             #[cfg(feature = "cuda")]
-            Backend::Gpu { router, log } => router
-                .log_only(&host, num_experts, k, mode, layer_id, token_offset, log)
-                .map_err(gpu_err),
+            Backend::Gpu {
+                router,
+                log,
+                biases,
+            } => {
+                let gate = GpuGate {
+                    gating,
+                    bias: biases.get(&layer_id),
+                };
+                router
+                    .log_only(&host, num_experts, k, gate, layer_id, token_offset, log)
+                    .map_err(gpu_err)
+            }
         })
     }
 
@@ -205,9 +310,9 @@ impl Recorder {
         layer_id: u16,
         token_offset: u32,
     ) -> PyResult<()> {
-        let mode = self.mode;
+        let gating = self.gating;
         match &mut self.backend {
-            Backend::Cpu(_) => {
+            Backend::Cpu { .. } => {
                 let _ = (
                     py,
                     ptr,
@@ -216,21 +321,29 @@ impl Recorder {
                     k,
                     layer_id,
                     token_offset,
-                    mode,
+                    gating,
                 );
                 Err(PyRuntimeError::new_err(
                     "route_and_log_device needs the CUDA backend",
                 ))
             }
             #[cfg(feature = "cuda")]
-            Backend::Gpu { router, log } => py.detach(move || {
+            Backend::Gpu {
+                router,
+                log,
+                biases,
+            } => py.detach(move || {
+                let gate = GpuGate {
+                    gating,
+                    bias: biases.get(&layer_id),
+                };
                 router
                     .log_only_device(
                         ptr,
                         num_tokens,
                         num_experts,
                         k,
-                        mode,
+                        gate,
                         layer_id,
                         token_offset,
                         log,
@@ -247,7 +360,7 @@ impl Recorder {
         let backend = &mut self.backend;
         let Drained { records, dropped } = py.detach(move || -> PyResult<Drained> {
             match backend {
-                Backend::Cpu(log) => Ok(log.drain()),
+                Backend::Cpu { log, .. } => Ok(log.drain()),
                 #[cfg(feature = "cuda")]
                 Backend::Gpu { log, .. } => log.drain().map_err(gpu_err),
             }

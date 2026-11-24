@@ -99,35 +99,48 @@ You need a Rust toolchain to build. The GPU build also needs the NVIDIA driver a
 ```python
 import moescope
 
-moescope.configure(capacity=50_000_000, mode="topk_softmax")  # 12 bytes per decision
+with moescope.attach(model) as session:      # finds every MoE router, reads the routing rule from the config
+    model.generate(**inputs)                 # or training steps, or plain forward passes
 
-def make_hook(layer_id):
-    def hook(_module, _inputs, out):
-        logits = out[0] if isinstance(out, tuple) else out
-        moescope.route_and_log(logits, k=8, layer_id=layer_id)
-    return hook
-
-for i, layer in enumerate(model.model.layers):
-    layer.block_sparse_moe.router.register_forward_hook(make_hook(i))  # OLMoE/Mixtral: layer.mlp.gate
-
-model(**inputs)                     # run as usual
-
-log = moescope.drain()              # structured numpy array
-log["expert_id"], log["gate"]       # fields: token_id, layer_id, expert_id, gate
+log = session.drain()                        # structured numpy array, one row per decision
+log["layer_id"], log["expert_id"], log["gate"], log["token_id"]
 ```
 
-| | |
-|---|---|
-| **Gate modes** | `softmax_topk` for OLMoE / Switch · `topk_softmax` for Mixtral / Granite |
-| **Zero-copy** | torch CUDA tensors are read in place: one pointer check, one kernel launch |
-| **Overflow** | `drain()` warns; `drain_with_stats()` returns the dropped count |
-| **Token ids** | pass `token_offset=` to keep ids unique across batches |
+`attach` hooks each router and logs its own logits: one kernel launch per layer, no recomputation, no host sync. `token_id` counts tokens in processing order, so it keeps working across `generate` steps. Pass `check=True` and `session.parity(log)` compares the log with the experts and gates the model itself chose.
 
-Try other models:
+Supported routing. Families in **bold** are tested against the real transformers code in `tests/python/test_hf_attach.py` (every expert choice identical, gates within 1e-7); the others use routing code identical to a tested family:
+
+| family | routing | moescope mode |
+|---|---|---|
+| **OLMoE**, **Qwen2/3-MoE**, **DeepSeek-V2** (`greedy`) | softmax over all experts → top-k (± renormalize, × scale) | `softmax_topk` / `topk_softmax` |
+| **Mixtral**, **Granite**, MiniMax, HunYuan | top-k logits → softmax over the k | `topk_softmax` |
+| **DeepSeek-V3**, **GLM-4.5**, **LFM2-MoE**, Kimi K2, dots1 | sigmoid + per-expert selection bias, group-limited top-k, renormalize, × scale | `sigmoid` with bias and groups |
+| Llama 4 (not yet tested: its router doesn't expose the chosen experts) | top-k logits → sigmoid | `sigmoid` |
+
+`attach` refuses what it can't reproduce exactly (DeepSeek-V2 `group_limited_greedy`, ERNIE-4.5) instead of logging something subtly wrong.
+
+<details>
+<summary>Lower-level API (no Hugging Face)</summary>
+
+```python
+moescope.configure(capacity=50_000_000, mode="sigmoid", normalize=True, scale=2.5, n_group=8, topk_group=4)
+moescope.set_bias(layer_id=3, bias=router.e_score_correction_bias)      # once per layer
+moescope.route_and_log(logits, k=8, layer_id=3, token_offset=offset)    # each step
+log = moescope.drain()
+```
+
+- **Zero-copy:** a torch CUDA tensor is read in place: one pointer check, one kernel launch.
+- **Overflow:** if the buffer fills up, `drain()` warns and `drain_with_stats()` returns the dropped count.
+
+</details>
+
+A full report (figure, raw log, `summary.json`):
 
 ```sh
+python examples/analyze_routing.py                                       # Granite-3.1-1B-A400M
 python examples/analyze_routing.py --model allenai/OLMoE-1B-7B-0924
-python examples/analyze_routing.py --toy granitemoe        # tiny offline model, no download
+python examples/analyze_routing.py --model LiquidAI/LFM2-8B-A1B --load-4bit   
+python examples/analyze_routing.py --toy deepseek_v3                     # tiny offline model
 ```
 
 ## Benchmark
@@ -178,12 +191,12 @@ moescope routes, gates and logs every token faster than torch can merely pick th
 
 | path | role |
 |---|---|
-| `src/router.rs` | CPU reference router: softmax, top-k, both gate modes, NaN-safe validation |
+| `src/router.rs` | CPU reference router: softmax / sigmoid gating, selection bias, group-limited top-k, NaN-safe validation |
 | `src/dispatcher.rs` | groups tokens per expert, builds the load histogram |
 | `src/telemetry.rs` | the 12-byte `#[repr(C)]` record and a bounded host log |
 | `src/gpu/kernels.rs` | CUDA C compiled at runtime with NVRTC: a lane group per token (warp shuffles), fused route + dispatch + log |
 | `src/gpu/raw.rs` | the **only** module allowed `unsafe`; every block has a safety comment |
-| `src/python.rs`, `python/moescope/` | PyO3 bindings and the numpy / torch API |
+| `src/python.rs`, `python/moescope/` | PyO3 bindings, the numpy / torch API, and `attach()` for Hugging Face models (`hf.py`) |
 
 <details>
 <summary>Design notes</summary>
@@ -200,7 +213,7 @@ moescope routes, gates and logs every token faster than torch can merely pick th
 ```sh
 cargo test                                # CPU: router, dispatch, telemetry, property tests
 cargo test --features cuda-13000          # builds the GPU path (GPU tests skip without a driver)
-python -m pytest -q tests/python          # Python bindings
+python -m pytest -q tests/python          # Python bindings + attach() parity on 11 model configurations
 bash scripts/colab.sh cuda-13000          # full GPU suite, ends with "ALL PHASES PASSED"
 bash scripts/colab_models.sh              # GPU stress test + routing reports for Granite-3B and OLMoE
 ```

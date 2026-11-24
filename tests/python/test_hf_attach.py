@@ -1,0 +1,142 @@
+"""moescope.attach() against the real Hugging Face routers.
+
+Each case builds a tiny randomly initialised model of one MoE family (the
+real transformers modelling code, no download), attaches moescope, runs a
+forward pass, and checks that every (layer, token) expert set and its gates
+match what the model's own router produced.
+
+    python -m pytest -q tests/python/test_hf_attach.py
+    MOESCOPE_DEVICE=cuda python -m pytest -q tests/python/test_hf_attach.py   # GPU kernel
+"""
+
+import os
+
+import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
+transformers = pytest.importorskip("transformers")
+
+import moescope  # noqa: E402
+
+DEVICE = os.environ.get("MOESCOPE_DEVICE", "cpu")
+COMMON = dict(vocab_size=256, hidden_size=64, num_attention_heads=4, num_key_value_heads=4,
+              max_position_embeddings=128, pad_token_id=0, bos_token_id=1, eos_token_id=2)
+
+
+def _deepseek_like(cfg_cls, model_cls, **kw):
+    cfg = cfg_cls(**COMMON, intermediate_size=128, moe_intermediate_size=32, num_hidden_layers=3,
+                  first_k_dense_replace=1, n_shared_experts=1, q_lora_rank=None, kv_lora_rank=16,
+                  qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=16, **kw)
+    model = model_cls(cfg)
+    with torch.no_grad():  # a non-zero selection bias, so the bias path matters
+        for mod in model.modules():
+            if hasattr(mod, "e_score_correction_bias"):
+                mod.e_score_correction_bias.normal_(0, 0.3)
+    return model
+
+
+def build(family):
+    T = transformers
+    torch.manual_seed(0)
+    if family == "olmoe":
+        return T.OlmoeForCausalLM(T.OlmoeConfig(**COMMON, intermediate_size=64, num_hidden_layers=2,
+                                                num_experts=16, num_experts_per_tok=4))
+    if family == "mixtral":
+        return T.MixtralForCausalLM(T.MixtralConfig(**COMMON, intermediate_size=64, num_hidden_layers=2,
+                                                    num_local_experts=8, num_experts_per_tok=2))
+    if family == "granitemoe":
+        return T.GraniteMoeForCausalLM(T.GraniteMoeConfig(**COMMON, intermediate_size=64, num_hidden_layers=2,
+                                                          num_local_experts=16, num_experts_per_tok=4))
+    if family in ("qwen3_moe", "qwen3_moe_nonorm"):
+        return T.Qwen3MoeForCausalLM(T.Qwen3MoeConfig(**COMMON, intermediate_size=64, moe_intermediate_size=32,
+                                                      num_hidden_layers=2, num_experts=16, num_experts_per_tok=4,
+                                                      norm_topk_prob=family == "qwen3_moe", head_dim=16))
+    if family == "qwen2_moe":
+        return T.Qwen2MoeForCausalLM(T.Qwen2MoeConfig(**COMMON, intermediate_size=64, moe_intermediate_size=32,
+                                                      shared_expert_intermediate_size=32, num_hidden_layers=2,
+                                                      num_experts=16, num_experts_per_tok=4))
+    if family == "deepseek_v3":
+        return _deepseek_like(T.DeepseekV3Config, T.DeepseekV3ForCausalLM, n_routed_experts=32,
+                              num_experts_per_tok=4, n_group=4, topk_group=2, norm_topk_prob=True,
+                              routed_scaling_factor=2.5)
+    if family == "deepseek_v3_nogroup":
+        return _deepseek_like(T.DeepseekV3Config, T.DeepseekV3ForCausalLM, n_routed_experts=16,
+                              num_experts_per_tok=4, n_group=1, topk_group=1, norm_topk_prob=False,
+                              routed_scaling_factor=1.0)
+    if family == "glm4_moe":
+        cfg = T.Glm4MoeConfig(**COMMON, intermediate_size=128, moe_intermediate_size=32, num_hidden_layers=3,
+                              first_k_dense_replace=1, n_shared_experts=1, n_routed_experts=16,
+                              num_experts_per_tok=4, n_group=2, topk_group=1, norm_topk_prob=True,
+                              routed_scaling_factor=1.8, head_dim=16)
+        model = T.Glm4MoeForCausalLM(cfg)
+        with torch.no_grad():
+            for mod in model.modules():
+                if hasattr(mod, "e_score_correction_bias"):
+                    mod.e_score_correction_bias.normal_(0, 0.3)
+        return model
+    if family == "deepseek_v2":
+        return _deepseek_like(T.DeepseekV2Config, T.DeepseekV2ForCausalLM, n_routed_experts=16,
+                              num_experts_per_tok=4, topk_method="greedy", routed_scaling_factor=1.5)
+    if family == "lfm2_moe":
+        cfg = T.Lfm2MoeConfig(vocab_size=256, hidden_size=64, intermediate_size=128, moe_intermediate_size=32,
+                              num_hidden_layers=4, num_dense_layers=1, num_attention_heads=4, num_key_value_heads=4,
+                              num_experts=16, num_experts_per_tok=4, norm_topk_prob=True, use_expert_bias=True,
+                              routed_scaling_factor=1.5, layer_types=["full_attention", "conv", "full_attention", "conv"],
+                              max_position_embeddings=128, pad_token_id=0, bos_token_id=1, eos_token_id=2)
+        model = T.Lfm2MoeForCausalLM(cfg)
+        with torch.no_grad():
+            for mod in model.modules():
+                if hasattr(mod, "expert_bias"):
+                    mod.expert_bias.normal_(0, 0.3)
+        return model
+    raise ValueError(family)
+
+
+FAMILIES = ["olmoe", "mixtral", "granitemoe", "qwen3_moe", "qwen3_moe_nonorm", "qwen2_moe",
+            "deepseek_v3", "deepseek_v3_nogroup", "glm4_moe", "deepseek_v2", "lfm2_moe"]
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_attach_matches_the_models_own_router(family):
+    if DEVICE.startswith("cuda") and not moescope.cuda_available():
+        pytest.skip("no CUDA")
+    model = build(family).to(DEVICE if DEVICE != "cpu" else "cpu").eval()
+    ids = torch.randint(3, 256, (2, 48), device=model.device)
+    with moescope.attach(model, check=True, device=DEVICE) as session:
+        with torch.no_grad():
+            model(input_ids=ids)
+            model(input_ids=ids[:, :17])  # second pass: token ids continue
+    log, dropped = session.drain_with_stats()
+    spec = session.spec
+    n_layers = len(session.routers)
+    assert dropped == 0
+    assert len(log) == (2 * 48 + 2 * 17) * n_layers * spec.k
+    assert log["token_id"].max() == 2 * 48 + 2 * 17 - 1
+    par = session.parity(log)
+    assert par is not None, "router did not expose its chosen experts"
+    assert par["match_rate"] == 1.0, (family, par)
+    assert par["max_gate_err"] < 1e-5, (family, par)
+
+
+def test_deepseek_bias_and_groups_change_the_choice():
+    """The test above is not vacuous: logging DeepSeek-V3 without its groups
+    and with a zero bias must disagree with the model for some tokens."""
+    import dataclasses
+
+    model = build("deepseek_v3").eval()
+    plain = dataclasses.replace(moescope.routing_spec(model.config), n_group=1, topk_group=1)
+    ids = torch.randint(3, 256, (2, 48))
+    with moescope.attach(model, check=True, device="cpu", spec=plain) as session:
+        for layer_id in session.routers:
+            session.recorder.set_bias(layer_id, np.zeros(plain.num_experts, np.float32))
+        with torch.no_grad():
+            model(input_ids=ids)
+    assert session.parity(session.drain())["match_rate"] < 0.9
+
+
+def test_unsupported_routing_is_refused():
+    cfg = transformers.DeepseekV2Config(**COMMON, num_hidden_layers=1, n_routed_experts=8, num_experts_per_tok=2,
+                                        topk_method="group_limited_greedy", n_group=2, topk_group=1)
+    with pytest.raises(moescope.hf.UnsupportedRouting):
+        moescope.routing_spec(cfg)

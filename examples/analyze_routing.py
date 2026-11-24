@@ -4,7 +4,8 @@ per-domain expert specialisation, and save a figure.
 
     python examples/analyze_routing.py                       # Granite-3.1-1B-A400M (32 experts, top-8)
     python examples/analyze_routing.py --model allenai/OLMoE-1B-7B-0924
-    python examples/analyze_routing.py --toy granitemoe      # tiny random model, offline smoke test
+    python examples/analyze_routing.py --model LiquidAI/LFM2-8B-A1B --load-4bit   # sigmoid + selection bias
+    python examples/analyze_routing.py --toy deepseek_v3     # tiny random model, offline smoke test
 
 Outputs (in --out, default ./routing_report/):
     routing_report.png   heatmaps + per-layer stats
@@ -19,7 +20,6 @@ import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 import moescope
 
@@ -93,10 +93,6 @@ reste qu'une odeur de pain chaud et quelques pétales oubliés sur les pavés.
 ''',
 }
 
-# Where each architecture keeps its router (first match wins).
-ROUTER_PATHS = ["mlp.gate", "block_sparse_moe.router", "block_sparse_moe.gate", "mlp.router"]
-
-
 def build_model(args):
     if args.toy:
         return build_toy(args.toy, args.device), None
@@ -104,9 +100,18 @@ def build_model(args):
 
     dtype = torch.float16 if args.device == "cuda" else torch.float32
     tok = AutoTokenizer.from_pretrained(args.model)
+    extra = {}
+    if args.load_4bit:
+        # Expert/attention matmuls in 4-bit (fp16 compute); everything that
+        # is not quantized, including the router weights, stays fp32, so
+        # routing is computed exactly as in full precision.
+        from transformers import BitsAndBytesConfig
+
+        extra["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+        dtype = torch.float32
     # device_map loads weights straight onto the GPU: OLMoE-1B-7B is ~14 GB in
     # fp16, more than a free Colab VM's RAM, but it fits a 16 GB T4.
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, device_map=args.device).eval()
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, device_map=args.device, **extra).eval()
     return model, tok
 
 
@@ -124,43 +129,14 @@ def build_toy(kind, device):
     if kind == "olmoe":
         cfg = T.OlmoeConfig(num_experts=16, num_experts_per_tok=4, **common)
         return T.OlmoeForCausalLM(cfg).to(device).eval()
+    if kind == "deepseek_v3":
+        cfg = T.DeepseekV3Config(n_routed_experts=32, num_experts_per_tok=4, n_group=4, topk_group=2,
+                                 norm_topk_prob=True, routed_scaling_factor=2.5, moe_intermediate_size=64,
+                                 first_k_dense_replace=1, q_lora_rank=None, kv_lora_rank=32, qk_nope_head_dim=16,
+                                 qk_rope_head_dim=16, v_head_dim=32, **common)
+        return T.DeepseekV3ForCausalLM(cfg).to(device).eval()
     cfg = T.MixtralConfig(num_local_experts=8, num_experts_per_tok=2, **common)
     return T.MixtralForCausalLM(cfg).to(device).eval()
-
-
-def routing_spec(config):
-    """(num_experts, k, moescope mode) for a model config."""
-    e = getattr(config, "num_experts", None) or getattr(config, "num_local_experts")
-    k = config.num_experts_per_tok
-    if config.model_type in ("mixtral", "granitemoe"):
-        mode = "topk_softmax"  # top-k on logits, softmax over the k selected
-    else:
-        mode = "topk_softmax" if getattr(config, "norm_topk_prob", False) else "softmax_topk"
-    return e, k, mode
-
-
-def find_routers(model):
-    routers = []
-    for layer in model.model.layers:
-        for path in ROUTER_PATHS:
-            mod = layer
-            for part in path.split("."):
-                mod = getattr(mod, part, None)
-                if mod is None:
-                    break
-            if mod is not None:
-                routers.append(mod)
-                break
-        else:
-            raise SystemExit(f"no MoE router found in {type(layer).__name__}; add its path to ROUTER_PATHS")
-    return routers
-
-
-def router_weight(router):
-    """[num_experts, hidden] weight of a router (module.weight or a wrapped Linear)."""
-    if isinstance(getattr(router, "weight", None), torch.Tensor):
-        return router.weight
-    return router.layer.weight  # transformers 4.x GraniteMoeTopKGating
 
 
 def tokenize(tok, text, vocab_size, device, seq_cap=512):
@@ -169,54 +145,6 @@ def tokenize(tok, text, vocab_size, device, seq_cap=512):
     else:
         ids = tok(text, return_tensors="pt").input_ids[0][:seq_cap]
     return ids.unsqueeze(0).to(device)
-
-
-class RoutingLogger:
-    """Hooks every router: logs decisions with moescope and (optionally)
-    keeps the model's own top-k choice for a parity check.
-
-    When the router returns its logits (transformers >= 5), those are logged
-    directly, so the hook adds no matmul. Otherwise (4.x Linear routers) the
-    logits are recomputed from the router input with the router's own weight,
-    which is the same op and gives bit-identical logits.
-    """
-
-    def __init__(self, routers, k, num_experts, check_parity):
-        self.routers, self.k, self.e, self.check = routers, k, num_experts, check_parity
-        self.offset, self.handles, self.reference = 0, [], {}
-        self._inputs = {}
-
-    def attach(self):
-        for layer_id, r in enumerate(self.routers):
-            self.handles.append(r.register_forward_pre_hook(self._pre(layer_id)))
-            self.handles.append(r.register_forward_hook(self._post(layer_id, r)))
-
-    def detach(self):
-        for h in self.handles:
-            h.remove()
-        self.handles, self._inputs = [], {}
-
-    def _pre(self, layer_id):
-        def hook(_mod, inputs):
-            self._inputs[layer_id] = inputs[0]
-        return hook
-
-    def _post(self, layer_id, router):
-        def hook(_mod, _inp, out):
-            h = self._inputs.pop(layer_id)
-            # Routers differ in what they return and in what order: a bare
-            # logits tensor, (logits, scores, indices) for OLMoE/Mixtral, or
-            # (indices, weights, logits) for Granite. Pick by dtype and shape.
-            outs = out if isinstance(out, tuple) else (out,)
-            tensors = [t for t in outs if isinstance(t, torch.Tensor)]
-            logits = next((t for t in tensors if t.is_floating_point() and t.shape[-1] == self.e), None)
-            indices = next((t for t in tensors if not t.is_floating_point() and t.shape[-1] == self.k), None)
-            if logits is None:  # 4.x Linear routers: recompute with the router's own weight
-                logits = F.linear(h.reshape(-1, h.shape[-1]), router_weight(router)).float()
-            moescope.route_and_log(logits, k=self.k, layer_id=layer_id, token_offset=self.offset)
-            if self.check and indices is not None:
-                self.reference[(layer_id, self.offset)] = indices.reshape(-1, self.k).cpu()
-        return hook
 
 
 def analyse(log, domain_of_token, num_layers, num_experts, k):
@@ -250,25 +178,6 @@ def analyse(log, domain_of_token, num_layers, num_experts, k):
                      for l in range(num_layers)])
     return dict(load=load, share=share, imbalance=imbalance, dead=dead, top1=top1_by_layer,
                 usage=usage, specialisation=spec, domains=domains)
-
-
-def parity(log, reference, k):
-    """Fraction of (layer, token) decisions whose expert set equals the model's."""
-    if not reference:
-        return None
-    by_key = {}
-    srt = log[np.lexsort((log["expert_id"], log["token_id"], log["layer_id"]))]
-    ids = srt["expert_id"].reshape(-1, k)
-    keys = np.stack([srt["layer_id"][::k], srt["token_id"][::k]], 1)
-    for row, (l, t) in zip(ids, keys):
-        by_key[(int(l), int(t))] = row
-    match = total = 0
-    for (layer, offset), idx in reference.items():
-        ref = np.sort(idx.numpy(), axis=1)
-        for i, r in enumerate(ref):
-            total += 1
-            match += np.array_equal(by_key[(layer, offset + i)], r)
-    return match / total, total
 
 
 def plot(stats, title, path):
@@ -338,7 +247,8 @@ def time_forward(model, batches, reps, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="ibm-granite/granite-3.1-1b-a400m-base")
-    ap.add_argument("--toy", choices=["granitemoe", "olmoe", "mixtral"], default="")
+    ap.add_argument("--toy", choices=["granitemoe", "olmoe", "mixtral", "deepseek_v3"], default="")
+    ap.add_argument("--load-4bit", action="store_true", help="bitsandbytes 4-bit weights (routers stay fp)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--repeat", type=int, default=8, help="passes over the domain texts (more tokens)")
     ap.add_argument("--out", default="routing_report")
@@ -346,74 +256,78 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     model, tok = build_model(args)
-    num_experts, k, mode = routing_spec(model.config)
-    routers = find_routers(model)
-    num_layers = len(routers)
+    spec = moescope.routing_spec(model.config)
+    num_experts, k = spec.num_experts, spec.k
     name = f"toy-{args.toy}" if args.toy else args.model.split("/")[-1]
     backend = "cuda" if args.device == "cuda" and moescope.cuda_available() else "cpu"
     batches = [tokenize(tok, text, model.config.vocab_size, args.device) for text in DOMAINS.values()]
     tokens_per_pass = sum(b.shape[1] for b in batches)
-    capacity = tokens_per_pass * args.repeat * num_layers * k
-    rec = moescope.configure(capacity=capacity, mode=mode, device=backend)
-    print(f"{name}: {num_layers} MoE layers, {num_experts} experts, top-{k}, mode={mode}, moescope backend={rec.backend}")
 
     # 1) Logging cost: same forward passes with and without the moescope hooks.
-    logger = RoutingLogger(routers, k, num_experts, check_parity=False)
     time_forward(model, batches, 2, args.device)  # warm-up
     t_plain = time_forward(model, batches, 5, args.device)
-    logger.attach()
-    t_logged = time_forward(model, batches, 5, args.device)
-    logger.detach()
-    moescope.drain_with_stats()  # discard timing-run records (may overflow; irrelevant)
+    with moescope.attach(model, device=backend, capacity=1 << 24) as timing:
+        t_logged = time_forward(model, batches, 5, args.device)
+    timing.drain_with_stats()  # discard timing-run records
 
     # 2) The real logging run (+ parity check against the model's own router).
-    logger = RoutingLogger(routers, k, num_experts, check_parity=True)
-    logger.attach()
+    layer_ids = sorted(timing.routers)
+    num_layers = len(layer_ids)
+    capacity = tokens_per_pass * args.repeat * num_layers * k
+    session = moescope.attach(model, device=backend, capacity=capacity, check=True)
+    print(f"{name}: {num_layers} MoE layers, {num_experts} experts, top-{k}, mode={spec.mode} "
+          f"(normalize={spec.normalize}, scale={spec.scale}, groups={spec.n_group}/{spec.topk_group}), "
+          f"moescope backend={session.recorder.backend}")
     domain_of_token = []
-    with torch.no_grad():
+    with session, torch.no_grad():
         for _ in range(args.repeat):
             for d, ids in enumerate(batches):
                 model(input_ids=ids)
-                logger.offset += ids.shape[1]
                 domain_of_token += [d] * ids.shape[1]
-    logger.detach()
-    log, dropped = moescope.drain_with_stats()
+    log, dropped = session.drain_with_stats()
     domain_of_token = np.array(domain_of_token)
-    assert dropped == 0 and len(log) == logger.offset * num_layers * k, (dropped, len(log))
+    assert dropped == 0 and len(log) == session.offset * num_layers * k, (dropped, len(log))
+    par = session.parity(log)
+    # Dense layers (e.g. DeepSeek's first ones) have no router: analyse MoE
+    # layers by position; layer_ids maps positions back to model layers.
+    log = log.copy()
+    log["layer_id"] = np.searchsorted(layer_ids, log["layer_id"])
 
     stats = analyse(log, domain_of_token, num_layers, num_experts, k)
-    par = parity(log, logger.reference, k)
-    title = f"{name}: routing of {logger.offset:,} tokens x {num_layers} layers ({len(log):,} decisions), logged with moescope"
+    title = f"{name}: routing of {session.offset:,} tokens x {num_layers} layers ({len(log):,} decisions), logged with moescope"
     plot(stats, title, os.path.join(args.out, "routing_report.png"))
     np.savez_compressed(os.path.join(args.out, "routing_log.npz"), log=log, domain_of_token=domain_of_token,
                         domains=np.array(stats["domains"]))
 
     summary = {
         "model": name, "device": torch.cuda.get_device_name() if args.device == "cuda" else "cpu",
-        "moescope_backend": rec.backend, "layers": num_layers, "experts": num_experts, "k": k, "mode": mode,
-        "tokens": int(logger.offset), "decisions": int(len(log)), "dropped": int(dropped),
+        "moescope_backend": session.recorder.backend, "layers": num_layers, "experts": num_experts, "k": k,
+        "tokens": int(session.offset), "decisions": int(len(log)), "dropped": int(dropped),
         "forward_ms_plain": round(t_plain, 2), "forward_ms_logged": round(t_logged, 2),
         "logging_overhead_pct": round(100 * (t_logged - t_plain) / t_plain, 1),
-        "parity_with_model_router": None if par is None else {"match_rate": par[0], "decisions_checked": par[1]},
+        "parity_with_model_router": par, "moe_layer_ids": layer_ids,
+        "gating": {"mode": spec.mode, "normalize": spec.normalize, "scale": spec.scale,
+                   "n_group": spec.n_group, "topk_group": spec.topk_group},
         "imbalance_per_layer": np.round(stats["imbalance"], 2).tolist(),
         "idle_experts_per_layer": stats["dead"].tolist(),
         "mean_top1_gate_per_layer": np.round(stats["top1"], 3).tolist(),
         "specialisation_bits_per_layer": np.round(stats["specialisation"], 3).tolist(),
-        "most_specialised_layer": int(np.argmax(stats["specialisation"])),
+        "most_specialised_layer": layer_ids[int(np.argmax(stats["specialisation"]))],
     }
     with open(os.path.join(args.out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\nlogged {len(log):,} routing decisions ({logger.offset:,} tokens x {num_layers} layers x top-{k}), dropped={dropped}")
+    print(f"\nlogged {len(log):,} routing decisions ({session.offset:,} tokens x {num_layers} layers x top-{k}), dropped={dropped}")
     print(f"forward pass: {t_plain:.1f} ms plain vs {t_logged:.1f} ms with moescope logging "
           f"({summary['logging_overhead_pct']:+.1f}%)")
     if par is not None:
-        print(f"parity: {100 * par[0]:.2f}% of {par[1]:,} (layer, token) expert sets match the model's own router")
+        print(f"parity: {100 * par['match_rate']:.2f}% of {par['checked']:,} (layer, token) expert sets match "
+              f"the model's own router; max gate difference {par['max_gate_err']:.1e}")
     print(f"load imbalance (busiest expert / fair share): min {stats['imbalance'].min():.2f}, "
-          f"max {stats['imbalance'].max():.2f} (layer {int(stats['imbalance'].argmax())})")
+          f"max {stats['imbalance'].max():.2f} (layer {layer_ids[int(stats['imbalance'].argmax())]})")
     print(f"idle experts (<10% of fair share): {int(stats['dead'].sum())} across all layers")
     print(f"most domain-specialised layer: {summary['most_specialised_layer']} "
-          f"({stats['specialisation'].max():.3f} bits JS); least: {int(stats['specialisation'].argmin())}")
+          f"({stats['specialisation'].max():.3f} bits JS); least: {layer_ids[int(stats['specialisation'].argmin())]}")
     print(f"\nwrote {args.out}/routing_report.png, routing_log.npz, summary.json")
 
 
