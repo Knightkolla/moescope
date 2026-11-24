@@ -8,6 +8,7 @@ moescope logs every routing decision on the GPU, inside a CUDA kernel, and hands
 
 ![Rust](https://img.shields.io/badge/Rust-core-orange?logo=rust)
 ![CUDA](https://img.shields.io/badge/CUDA-NVRTC-76B900?logo=nvidia)
+[![PyPI](https://img.shields.io/pypi/v/moescope)](https://pypi.org/project/moescope/)
 ![Python](https://img.shields.io/badge/Python-PyO3-3776AB?logo=python&logoColor=white)
 ![Overhead](https://img.shields.io/badge/overhead-%3C3%25-brightgreen)
 ![Parity](https://img.shields.io/badge/router%20parity-100%25-brightgreen)
@@ -86,25 +87,29 @@ The results above come from ~8k tokens. `examples/corpus_study.py` repeats the a
 ## Quick start
 
 ```sh
-pip install maturin
-maturin build --release -F python,pyo3/extension-module,cuda-12040 -o dist
-pip install dist/moescope-*.whl
-
-python examples/analyze_routing.py      # → routing_report.png, routing_log.npz, summary.json
+pip install moescope
 ```
 
-The CUDA backend is loaded at run time: the same wheel works on CUDA 12.4+ and 13 drivers, and falls back to the CPU router when there is no NVIDIA driver. A `pip install moescope` release is set up (`.github/workflows/release.yml`) but not published yet.
+```python
+import moescope
+
+with moescope.attach(model) as session:   # any supported Hugging Face MoE model
+    model(**inputs)
+log = session.drain()
+```
+
+On Linux the wheel includes the CUDA backend. It is loaded at run time, works with CUDA 12.4+ and 13 drivers, and falls back to the CPU router when there is no NVIDIA driver. macOS wheels are CPU only.
 
 <details>
-<summary>CPU only / other options</summary>
-
-CPU only (any OS, for trying it out):
+<summary>Build from source</summary>
 
 ```sh
-pip install maturin && maturin develop --release
+pip install maturin
+maturin build --release -F python,pyo3/extension-module,cuda-12040 -o dist   # or cuda-13000 / cuda-auto
+pip install dist/moescope-*.whl
 ```
 
-You need a Rust toolchain to build. The GPU build also needs the NVIDIA driver and NVRTC (from the CUDA toolkit) at run time. `cuda-13000`, `cuda-12080` and `cuda-auto` (detect from the installed toolkit) are also available.
+CPU only: `maturin develop --release`. You need a Rust toolchain; the GPU path also needs NVRTC (from the CUDA toolkit) at run time.
 
 </details>
 
