@@ -65,9 +65,23 @@ The same pattern shows up in the first three: in the most specialised layer, **c
 </tr>
 </table>
 
-> Each run uses ~8k tokens of hand-written text. The numbers show what the log can reveal; they are not a study of these models. Granite-1B ran on Colab; the others on Kaggle (transformers 5.20).
+> Each run uses ~8k tokens of hand-written text. The numbers show what the log can reveal; they are not a study of these models (see [Routing at scale](#routing-at-scale)). Granite-1B ran on Colab; the others on Kaggle (transformers 5.20).
 >
 > ¹ Measured with the earlier one-thread-per-token kernel. ² fp16 model split over two T4s; each layer's logits are copied to the logging GPU first.
+
+## Routing at scale
+
+The results above come from ~8k tokens. `examples/corpus_study.py` repeats the analysis on real corpora: **~100k tokens per domain** (code: MBPP + HumanEval, maths: GSM8K, English: WikiText-103, French: Wikipedia), **51.1M routing decisions** from OLMoE-1B-7B, 0 dropped, logged in 70 s on one T4. Intervals are 95% bootstrap intervals over 512-token chunks.
+
+![Routing study for OLMoE-1B-7B](docs/olmoe_study.png)
+
+1. **Code and maths really do share experts.** Overlap of their 8 most-used experts per layer (Jaccard): **0.37 (0.35–0.38)**. Every other domain pair: 0.05–0.22, with English–French next at 0.22. The peak is layer 8, where code and maths share 7 of their top 8 experts.
+2. **Load imbalance is real and stable:** the busiest expert gets **3.55× (3.51–3.59)** its fair share, 2.7–4.1× in every layer.
+3. **Idle experts mostly disappear with enough data.** Only **2 of 1,024** experts fall below 10% of a fair share, versus 26 on the 8k-token run. So the near-idle counts in the table above are mainly a small-sample effect.
+4. **Position barely matters:** tokens at positions < 64 and ≥ 256 are routed almost identically (JS divergence ≤ 0.011 bits, except 0.035 in layer 0).
+5. **Routing drifts during generation, more in deeper layers.** Over 512 greedily generated tokens (8 prompts), the JS divergence between the first and last quarter grows from 0.01 bits in layer 0 to 0.06–0.09 bits in layers 8–15.
+
+> One model, four domains, greedy decoding: a measurement, not a general claim about MoE models. The raw numbers are in [`docs/olmoe_study.json`](docs/olmoe_study.json).
 
 ## Quick start
 

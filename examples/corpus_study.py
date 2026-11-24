@@ -217,8 +217,8 @@ def main():
     # 3) position: JS divergence between early (<64) and late (>=256) positions, per layer
     early, late = usage(log[pos < 64], L, E), usage(log[pos >= 256], L, E)
     pos_js = [js_bits(early[l], late[l]) for l in range(L)]
-    half = len(chunk_domain) // 2  # noise floor: same positions, two halves of the corpus
-    split = chunk < half
+    # Noise floor: same positions, alternating chunks (every domain is on both sides).
+    split = chunk % 2 == 0
     floor_js = [js_bits(usage(log[split & (pos >= 256)], L, E)[l], usage(log[~split & (pos >= 256)], L, E)[l]) for l in range(L)]
 
     result = {
@@ -286,7 +286,8 @@ def plot(r, domains, path):
     ax[1].axhline(1, color="k", lw=0.8, ls="--")
     ax[1].set(title="Busiest expert vs fair share", xlabel="MoE layer", ylabel="x fair share")
     ax[2].plot(layers, r["position_js_early_vs_late_per_layer"], marker="o", ms=3, label="positions <64 vs >=256")
-    ax[2].plot(layers, r["position_js_noise_floor_per_layer"], ls="--", label="noise floor (corpus halves)")
+    if r.get("position_js_noise_floor_per_layer"):
+        ax[2].plot(layers, r["position_js_noise_floor_per_layer"], ls="--", label="noise floor (alternate chunks)")
     if r["generation_drift"]:
         ax[2].plot(layers, r["generation_drift"]["js_first_vs_last_quarter_per_layer"], marker="s", ms=3,
                    label="generation: first vs last quarter")
