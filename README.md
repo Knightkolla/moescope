@@ -50,7 +50,20 @@ Three MoE models from two labs, each hooked on every MoE layer and fed the same 
 | Near-idle experts (<10% of fair share) | 17 of 768 | 64 of 1,280 | 26 of 1,024 |
 | Most domain-specialised layer | 14 | 22 | 15 |
 
-"Match" compares moescope's expert set for every (layer, token) with the experts the model itself picked in the same forward pass. In Granite-1B's most specialised layer, code and maths both lean on expert 13, while prose and French spread across others (figure above).
+"Match" compares moescope's expert set for every (layer, token) with the experts the model itself picked in the same forward pass.
+
+The same pattern shows up in all three: in the most specialised layer, **code and maths share an expert** (Granite-1B layer 14: expert 13; Granite-3B layer 22: expert 27; OLMoE layer 15: experts 17 and 30), while prose and French spread across others. In OLMoE, routing gets both more domain-specific and more confident with depth.
+
+<table>
+<tr>
+<td><img src="docs/granite3b_routing_report.png" alt="Routing report for Granite-3.1-3B-A800M"></td>
+<td><img src="docs/olmoe_routing_report.png" alt="Routing report for OLMoE-1B-7B"></td>
+</tr>
+<tr>
+<td align="center"><sub>Granite-3.1-3B-A800M · 2.17M decisions</sub></td>
+<td align="center"><sub>OLMoE-1B-7B · 1.02M decisions</sub></td>
+</tr>
+</table>
 
 > Each run uses ~8k tokens of hand-written text. The numbers show what the log can reveal; they are not a study of these models. Granite-1B ran on Colab; Granite-3B and OLMoE on Kaggle (transformers 5.20).
 >
