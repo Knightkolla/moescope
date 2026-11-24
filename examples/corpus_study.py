@@ -167,7 +167,8 @@ def main():
             for di, d in enumerate(domains):
                 for b in range(0, len(data[d]), args.batch):
                     batch = data[d][b : b + args.batch].to(in_device)
-                    model(input_ids=batch)
+                    # Routing happens before the LM head; skip [batch, SEQ, vocab] logits.
+                    model(input_ids=batch, logits_to_keep=1)
                     chunk_domain += [di] * len(batch)
                     part, lost = session.drain_with_stats()
                     parts.append(part)
