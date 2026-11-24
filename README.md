@@ -11,6 +11,7 @@ moescope logs every routing decision on the GPU, inside a CUDA kernel, and hands
 ![Python](https://img.shields.io/badge/Python-PyO3-3776AB?logo=python&logoColor=white)
 ![Overhead](https://img.shields.io/badge/overhead-%3C1%25-brightgreen)
 ![Parity](https://img.shields.io/badge/router%20parity-100%25-brightgreen)
+[![CI](https://github.com/Knightkolla/moescope/actions/workflows/ci.yml/badge.svg)](https://github.com/Knightkolla/moescope/actions/workflows/ci.yml)
 
 </div>
 
@@ -73,16 +74,16 @@ The same pattern shows up in all three: in the most specialised layer, **code an
 
 ```sh
 pip install maturin
-maturin build --release -F python,pyo3/extension-module,cuda-13000 -o dist
+maturin build --release -F python,pyo3/extension-module,cuda-12040 -o dist
 pip install dist/moescope-*.whl
 
 python examples/analyze_routing.py      # → routing_report.png, routing_log.npz, summary.json
 ```
 
-<details>
-<summary>Other CUDA versions / CPU only</summary>
+The CUDA backend is loaded at run time: the same wheel works on CUDA 12.4+ and 13 drivers, and falls back to the CPU router when there is no NVIDIA driver. A `pip install moescope` release is set up (`.github/workflows/release.yml`) but not published yet.
 
-Choose the feature that matches the "CUDA Version" shown by `nvidia-smi`: `cuda-13000`, `cuda-12080`, `cuda-12040`, or `cuda-auto`.
+<details>
+<summary>CPU only / other options</summary>
 
 CPU only (any OS, for trying it out):
 
@@ -90,7 +91,7 @@ CPU only (any OS, for trying it out):
 pip install maturin && maturin develop --release
 ```
 
-You need a Rust toolchain to build. The GPU build also needs the NVIDIA driver and NVRTC (from the CUDA toolkit).
+You need a Rust toolchain to build. The GPU build also needs the NVIDIA driver and NVRTC (from the CUDA toolkit) at run time. `cuda-13000`, `cuda-12080` and `cuda-auto` (detect from the installed toolkit) are also available.
 
 </details>
 
@@ -142,6 +143,14 @@ python examples/analyze_routing.py --model allenai/OLMoE-1B-7B-0924
 python examples/analyze_routing.py --model LiquidAI/LFM2-8B-A1B --device-map auto
 python examples/analyze_routing.py --toy deepseek_v3                     # tiny offline model
 ```
+
+## Serving and CUDA graphs
+
+- **No host sync.** On the GPU, logging launches on the caller's current CUDA stream (`torch.cuda.current_stream()`), so it is ordered after the router that produced the logits without any synchronization, even on non-blocking streams.
+- **Half precision in place.** float16 and bfloat16 logits are read directly; nothing is converted or copied. For routers that compute `sigmoid` in half precision (LFM2-MoE), moescope rounds the scores the same way torch does, so the logged choice stays identical.
+- **CUDA graphs.** Logging can be captured into a CUDA graph and replayed. Token ids come from a device-side counter that a tiny kernel advances after each forward pass, so every replay logs fresh ids. `attach()` does this automatically on the GPU; with the low-level API, call `recorder.set_device_token_ids(True)` and `moescope.advance_tokens(n)` once per pass.
+
+Not built yet: hooks for vLLM / SGLang's own fused-MoE kernels (they do not call a `torch.nn.Module` router), and filtering of padding tokens in fixed-size graph batches.
 
 ## Benchmark
 
@@ -215,7 +224,7 @@ cargo test                                # CPU: router, dispatch, telemetry, pr
 cargo test --features cuda-13000          # builds the GPU path (GPU tests skip without a driver)
 python -m pytest -q tests/python          # Python bindings + attach() parity on 11 model configurations
 bash scripts/colab.sh cuda-13000          # full GPU suite, ends with "ALL PHASES PASSED"
-bash scripts/colab_models.sh              # GPU stress test + routing reports for Granite-3B and OLMoE
+bash scripts/colab_models.sh              # GPU parity + stream/graph tests, stress test, routing reports
 ```
 
 On a GPU machine, set `MOESCOPE_REQUIRE_GPU=1` so a missing driver fails the tests instead of skipping them.
