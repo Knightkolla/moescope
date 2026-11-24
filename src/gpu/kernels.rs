@@ -6,8 +6,8 @@
 //! `RouteEntry` = [`crate::router::Route`],
 //! `TelemetryRecord` = [`crate::telemetry::TelemetryRecord`].
 
-/// Largest `k` the kernels support. Each lane keeps the token's top-k in a
-/// fixed-size local array, so this is its bound.
+/// Largest `k` the kernels support (with `lanes_per_token`, it bounds the
+/// top-k slots one lane owns to 4).
 pub const MAX_K: usize = 32;
 
 /// Kernel entry-point names, kept next to the source that defines them.
@@ -209,6 +209,21 @@ __device__ void lane_best(const Row& row, unsigned int num_experts, const GatePa
     *bi = i;
 }
 
+// Most top-k slots one lane owns: slot j belongs to lane j % lanes, and
+// lanes_per_token() guarantees ceil(k / lanes) <= SLOTS for every allowed
+// (num_experts, k). A fixed, fully unrolled size keeps a lane's slots in
+// registers; per-lane arrays of all k entries spilled to local memory.
+#define SLOTS 4
+
+// What one lane keeps after top-k: its own slots (best-first order j =
+// lane + q * lanes), plus the two numbers every lane needs for the gates.
+struct Picks {
+    unsigned int ids[SLOTS];
+    float vals[SLOTS];
+    float top;      // the token's best ranking value (softmax max)
+    float exp_sum;  // sum over the k picks of exp(val - top) (topk_softmax)
+};
+
 // Top-k for one token, computed by a group of `lanes` threads.
 //
 // Every lane keeps the best expert of its own stripe. Each of the k rounds
@@ -222,13 +237,14 @@ __device__ void lane_best(const Row& row, unsigned int num_experts, const GatePa
 // and take part with no candidates.
 __device__ void group_top_k(const Row& row, bool valid, unsigned int num_experts,
                             unsigned int k, const GateParams& gp, unsigned int kept,
-                            unsigned int lane, unsigned int lanes,
-                            unsigned int* ids, float* vals) {
+                            unsigned int lane, unsigned int lanes, Picks& p) {
     unsigned int group_size = gp.num_groups > 1 ? num_experts / gp.num_groups : num_experts;
     float bv;
     unsigned int bi;
     if (valid) lane_best(row, num_experts, gp, kept, group_size, lane, lanes, false, 0.0f, 0, &bv, &bi);
-    else { bv = __int_as_float(0xff800000); bi = NO_EXPERT; }
+    else { bv = neg_inf(); bi = NO_EXPERT; }
+    p.top = neg_inf();
+    p.exp_sum = 0.0f;
     for (unsigned int j = 0; j < k; ++j) {
         float v = bv;
         unsigned int i = bi;
@@ -237,8 +253,14 @@ __device__ void group_top_k(const Row& row, bool valid, unsigned int num_experts
             unsigned int oi = __shfl_xor_sync(FULL_MASK, i, off, lanes);
             if (ranks_before(ov, oi, v, i)) { v = ov; i = oi; }
         }
-        vals[j] = v;
-        ids[j] = i;
+        if (j == 0) p.top = v;
+        if (!SIG && gp.mode == 1) p.exp_sum += expf(v - p.top);
+        if ((j & (lanes - 1)) == lane) {
+            unsigned int slot = j / lanes;
+#pragma unroll
+            for (unsigned int q = 0; q < SLOTS; ++q)
+                if (q == slot) { p.ids[q] = i; p.vals[q] = v; }
+        }
         if (valid && bi == i)
             lane_best(row, num_experts, gp, kept, group_size, lane, lanes, true, v, i, &bv, &bi);
     }
@@ -248,38 +270,35 @@ __device__ void group_top_k(const Row& row, bool valid, unsigned int num_experts
 //   0 = SoftmaxThenTopK: sum over all E logits, shared across the group.
 //   1 = TopKThenSoftmax: sum over the k selected logits only (Mixtral).
 //   2 = Sigmoid: unused (returns 0).
-// vals[0] is the row max in both cases, which keeps exp() from overflowing.
+// p.top is the row max in both cases, which keeps exp() from overflowing.
 __device__ float gate_denominator(const Row& row, bool valid, unsigned int num_experts,
-                                  unsigned int k, int mode, unsigned int lane,
-                                  unsigned int lanes, const float* vals) {
-    float max = vals[0];
+                                  int mode, unsigned int lane, unsigned int lanes, const Picks& p) {
+    if (SIG) return 0.0f;
+    if (mode == 1) return p.exp_sum;
     float sum = 0.0f;
-    if (mode == 0) {
-        if (valid)
-            for (unsigned int e = lane; e < num_experts; e += lanes) sum += expf(rank_key(at(row, e)) - max);
-        for (unsigned int off = lanes >> 1; off > 0; off >>= 1)
-            sum += __shfl_xor_sync(FULL_MASK, sum, off, lanes);
-    } else if (mode == 1) {
-        for (unsigned int j = 0; j < k; ++j) sum += expf(vals[j] - max);
-    }
+    if (valid)
+        for (unsigned int e = lane; e < num_experts; e += lanes) sum += expf(rank_key(at(row, e)) - p.top);
+    for (unsigned int off = lanes >> 1; off > 0; off >>= 1)
+        sum += __shfl_xor_sync(FULL_MASK, sum, off, lanes);
     return sum;
 }
 
-// Gate weights of the slots this lane writes (j = lane, lane + lanes, ...):
+// Gate weights of this lane's slots (gates[q] for j = lane + q * lanes < k):
 // mode-specific weights, then optional normalization by the sum over all k
 // (sum + 1e-20, as in Hugging Face's norm_topk_prob; the sum is a group
 // reduction of per-lane partial sums), then the scale. Every lane of the
 // warp must call this (reductions).
 __device__ void compute_gates(const Row& row, bool valid, unsigned int num_experts,
                               unsigned int k, const GateParams& gp, unsigned int lane,
-                              unsigned int lanes, const unsigned int* ids, const float* vals,
-                              float* gates) {
-    float sum = gate_denominator(row, valid, num_experts, k, gp.mode, lane, lanes, vals);
+                              unsigned int lanes, const Picks& p, float* gates) {
+    float sum = gate_denominator(row, valid, num_experts, gp.mode, lane, lanes, p);
     float part = 0.0f;
-    if (valid) {
-        for (unsigned int j = lane; j < k; j += lanes) {
-            gates[j] = SIG ? score(row, ids[j]) : expf(vals[j] - vals[0]) / sum;
-            part += gates[j];
+#pragma unroll
+    for (unsigned int q = 0; q < SLOTS; ++q) {
+        gates[q] = 0.0f;
+        if (valid && lane + q * lanes < k) {
+            gates[q] = SIG ? score(row, p.ids[q]) : expf(p.vals[q] - p.top) / sum;
+            part += gates[q];
         }
     }
     float scale = gp.scale;
@@ -288,8 +307,8 @@ __device__ void compute_gates(const Row& row, bool valid, unsigned int num_exper
             part += __shfl_xor_sync(FULL_MASK, part, off, lanes);
         scale /= part + 1e-20f;
     }
-    if (valid)
-        for (unsigned int j = lane; j < k; j += lanes) gates[j] *= scale;
+#pragma unroll
+    for (unsigned int q = 0; q < SLOTS; ++q) gates[q] *= scale;
 }
 
 // Which token this thread works on, and its lane within the token's group.
@@ -310,15 +329,19 @@ extern "C" __global__ void moe_route(const void* logits, unsigned int num_tokens
     token_and_lane(lanes, &t, &lane);
     bool valid = t < num_tokens;
     Row row = token_row(logits, valid, t, num_experts);
-    unsigned int ids[MAX_K];
-    float vals[MAX_K], gates[MAX_K];
+    Picks p;
+    float gates[SLOTS];
     unsigned int kept = kept_groups(row, valid, num_experts, gp, lane, lanes);
-    group_top_k(row, valid, num_experts, k, gp, kept, lane, lanes, ids, vals);
-    compute_gates(row, valid, num_experts, k, gp, lane, lanes, ids, vals, gates);
+    group_top_k(row, valid, num_experts, k, gp, kept, lane, lanes, p);
+    compute_gates(row, valid, num_experts, k, gp, lane, lanes, p, gates);
     if (!valid) return;
-    for (unsigned int j = lane; j < k; j += lanes) {
-        out[t * k + j].expert_id = ids[j];
-        out[t * k + j].gate = gates[j];
+#pragma unroll
+    for (unsigned int q = 0; q < SLOTS; ++q) {
+        unsigned int j = lane + q * lanes;
+        if (j < k) {
+            out[t * k + j].expert_id = p.ids[q];
+            out[t * k + j].gate = gates[q];
+        }
     }
 }
 
@@ -349,11 +372,11 @@ extern "C" __global__ void moe_route_dispatch_log(
     token_and_lane(lanes, &t, &lane);
     bool valid = t < num_tokens;
     Row row = token_row(logits, valid, t, num_experts);
-    unsigned int ids[MAX_K];
-    float vals[MAX_K], gates[MAX_K];
+    Picks p;
+    float gates[SLOTS];
     unsigned int kept = kept_groups(row, valid, num_experts, gp, lane, lanes);
-    group_top_k(row, valid, num_experts, k, gp, kept, lane, lanes, ids, vals);
-    compute_gates(row, valid, num_experts, k, gp, lane, lanes, ids, vals, gates);
+    group_top_k(row, valid, num_experts, k, gp, kept, lane, lanes, p);
+    compute_gates(row, valid, num_experts, k, gp, lane, lanes, p, gates);
 
     unsigned long long base = 0;
     if (valid && lane == 0) base = atomicAdd(&log_counters[0], (unsigned long long)k);
@@ -362,9 +385,12 @@ extern "C" __global__ void moe_route_dispatch_log(
 
     unsigned long long token_base = gp.token_base ? *gp.token_base : 0ull;
     unsigned int dropped = 0;
-    for (unsigned int j = lane; j < k; j += lanes) {
-        unsigned int e = ids[j];
-        float gate = gates[j];
+#pragma unroll
+    for (unsigned int q = 0; q < SLOTS; ++q) {
+        unsigned int j = lane + q * lanes;
+        if (j >= k) break;
+        unsigned int e = p.ids[q];
+        float gate = gates[q];
         if (write_dispatch) {
             unsigned int a = (unsigned int)t * k + j;
             routes[a].expert_id = e;
@@ -417,6 +443,19 @@ pub fn source(variant: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::lanes_per_token;
+
+    #[test]
+    fn a_lane_never_owns_more_than_four_slots() {
+        // The kernel keeps a lane's top-k slots in a fixed SLOTS = 4 array.
+        for e in 1..=70_000u32 {
+            let lanes = lanes_per_token(e);
+            let k_max = e.min(super::MAX_K as u32);
+            assert!(
+                k_max.div_ceil(lanes) <= 4,
+                "E={e}: k={k_max}, lanes={lanes}"
+            );
+        }
+    }
 
     #[test]
     fn lanes_are_a_power_of_two_dividing_a_warp() {
