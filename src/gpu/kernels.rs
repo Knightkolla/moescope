@@ -28,6 +28,11 @@ pub fn lanes_per_token(num_experts: u32) -> u32 {
 const SRC: &str = r#"
 #define MAX_K MOESCOPE_MAX_K
 #define MAX_GROUPS MOESCOPE_MAX_GROUPS
+// Compile-time variant (one NVRTC module per combination, see source()):
+// DT = logits dtype (0 float32, 1 float16, 2 bfloat16); SIG = sigmoid mode.
+// Keeping both out of the inner loops is what keeps the kernel fast.
+#define DT MOESCOPE_DT
+#define SIG MOESCOPE_SIG
 #define FULL_MASK 0xffffffffu
 #define NO_EXPERT 0xffffffffu
 #define ALL_GROUPS 0xffffffffu
@@ -53,27 +58,28 @@ struct GateParams {
     int pad;
 };
 
-// One token's logits in whatever precision the model produced them.
+// One token's logits, in the variant's precision DT.
 struct Row {
     const char* p;
-    int dtype;
 };
 
 // Logit of expert e as float32. float16 is widened with one PTX convert
 // (NVRTC has no cuda_fp16.h); bfloat16 is the top half of a float32.
 __device__ __forceinline__ float at(const Row& r, unsigned int e) {
-    if (r.dtype == 0) return ((const float*)r.p)[e];
-    unsigned short h = ((const unsigned short*)r.p)[e];
-    if (r.dtype == 2) return __int_as_float(((unsigned int)h) << 16);
+#if DT == 0
+    return ((const float*)r.p)[e];
+#elif DT == 2
+    return __int_as_float(((unsigned int)((const unsigned short*)r.p)[e]) << 16);
+#else
     float f;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(((const unsigned short*)r.p)[e]));
     return f;
+#endif
 }
 
 __device__ __forceinline__ Row token_row(const void* logits, bool valid, unsigned long long t,
-                                         unsigned int num_experts, int dtype) {
-    unsigned long long elem = dtype == 0 ? 4 : 2;
-    Row r = { (const char*)logits + (valid ? t : 0) * num_experts * elem, dtype };
+                                         unsigned int num_experts) {
+    Row r = { (const char*)logits + (valid ? t : 0) * num_experts * (DT == 0 ? 4ull : 2ull) };
     return r;
 }
 
@@ -113,36 +119,36 @@ __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-
 // stored in the tensor's dtype). Routers that call sigmoid on half-precision
 // logits (LFM2-MoE) select on those rounded scores; matching it exactly is
 // what keeps the logged choice identical to the model's.
-__device__ __forceinline__ float round_to(float x, int dtype) {
-    if (dtype == 1) {
-        unsigned short h;
-        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(x) : "h"(h));
-    } else if (dtype == 2) {
-        unsigned int b = __float_as_int(x);
-        b += 0x7fffu + ((b >> 16) & 1u);  // round to nearest even (finite inputs)
-        x = __int_as_float(b & 0xffff0000u);
-    }
+__device__ __forceinline__ float round_to(float x) {
+#if DT == 1
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(x) : "h"(h));
+#elif DT == 2
+    unsigned int b = __float_as_int(x);
+    b += 0x7fffu + ((b >> 16) & 1u);  // round to nearest even (finite inputs)
+    x = __int_as_float(b & 0xffff0000u);
+#endif
     return x;
 }
 
 // Sigmoid score of expert e, in the logits' precision.
 __device__ __forceinline__ float score(const Row& row, unsigned int e) {
-    return round_to(sigmoid(at(row, e)), row.dtype);
+    return round_to(sigmoid(at(row, e)));
 }
 
 // Sigmoid-mode score used for *selection*: score + bias[e].
 __device__ __forceinline__ float biased_score(const Row& row, unsigned int e, const GateParams& gp) {
     if (!gp.bias) return score(row, e);
     float c = score(row, e) + gp.bias[e];
-    return gp.round_biased ? round_to(c, row.dtype) : c;
+    return gp.round_biased ? round_to(c) : c;
 }
 
 // What top-k ranks for expert e: the raw logit in the softmax modes; in
 // sigmoid mode the biased score, or -inf if e's group was not kept.
 __device__ __forceinline__ float choice_key(const Row& row, unsigned int e, const GateParams& gp,
                                             unsigned int kept, unsigned int group_size) {
-    if (gp.mode != 2) return rank_key(at(row, e));
+    if (!SIG) return rank_key(at(row, e));
     if (!((kept >> (e / group_size)) & 1u)) return neg_inf();
     return rank_key(biased_score(row, e, gp));
 }
@@ -154,7 +160,7 @@ __device__ __forceinline__ float choice_key(const Row& row, unsigned int e, cons
 // merges them. Every lane of the warp must call this (shuffles).
 __device__ unsigned int kept_groups(const Row& row, bool valid, unsigned int num_experts,
                                     const GateParams& gp, unsigned int lane, unsigned int lanes) {
-    if (gp.mode != 2 || gp.num_groups <= 1) return ALL_GROUPS;
+    if (!SIG || gp.num_groups <= 1) return ALL_GROUPS;
     unsigned int size = num_experts / gp.num_groups;
     float group_score[MAX_GROUPS];
     for (unsigned int g = 0; g < gp.num_groups; ++g) {
@@ -272,7 +278,7 @@ __device__ void compute_gates(const Row& row, bool valid, unsigned int num_exper
     float part = 0.0f;
     if (valid) {
         for (unsigned int j = lane; j < k; j += lanes) {
-            gates[j] = gp.mode == 2 ? score(row, ids[j]) : expf(vals[j] - vals[0]) / sum;
+            gates[j] = SIG ? score(row, ids[j]) : expf(vals[j] - vals[0]) / sum;
             part += gates[j];
         }
     }
@@ -303,7 +309,7 @@ extern "C" __global__ void moe_route(const void* logits, unsigned int num_tokens
     unsigned int lane;
     token_and_lane(lanes, &t, &lane);
     bool valid = t < num_tokens;
-    Row row = token_row(logits, valid, t, num_experts, gp.logits_dtype);
+    Row row = token_row(logits, valid, t, num_experts);
     unsigned int ids[MAX_K];
     float vals[MAX_K], gates[MAX_K];
     unsigned int kept = kept_groups(row, valid, num_experts, gp, lane, lanes);
@@ -342,7 +348,7 @@ extern "C" __global__ void moe_route_dispatch_log(
     unsigned int lane;
     token_and_lane(lanes, &t, &lane);
     bool valid = t < num_tokens;
-    Row row = token_row(logits, valid, t, num_experts, gp.logits_dtype);
+    Row row = token_row(logits, valid, t, num_experts);
     unsigned int ids[MAX_K];
     float vals[MAX_K], gates[MAX_K];
     unsigned int kept = kept_groups(row, valid, num_experts, gp, lane, lanes);
@@ -388,12 +394,24 @@ extern "C" __global__ void moe_advance_tokens(unsigned long long* token_base, un
 }
 "#;
 
-/// Full kernel source with constants substituted, ready for NVRTC.
-pub fn source() -> String {
-    SRC.replace("MOESCOPE_MAX_K", &MAX_K.to_string()).replace(
-        "MOESCOPE_MAX_GROUPS",
-        &crate::router::MAX_GROUPS.to_string(),
-    )
+/// Number of compiled kernel variants: 3 logits dtypes x (softmax, sigmoid).
+pub const NUM_VARIANTS: usize = 6;
+
+/// Variant index for a logits dtype code (0 f32, 1 f16, 2 bf16) and mode.
+pub fn variant(dtype_code: usize, sigmoid: bool) -> usize {
+    dtype_code * 2 + sigmoid as usize
+}
+
+/// Kernel source for one variant, with constants substituted, ready for NVRTC.
+pub fn source(variant: usize) -> String {
+    assert!(variant < NUM_VARIANTS);
+    SRC.replace("MOESCOPE_MAX_K", &MAX_K.to_string())
+        .replace(
+            "MOESCOPE_MAX_GROUPS",
+            &crate::router::MAX_GROUPS.to_string(),
+        )
+        .replace("MOESCOPE_DT", &(variant / 2).to_string())
+        .replace("MOESCOPE_SIG", &(variant % 2).to_string())
 }
 
 #[cfg(test)]

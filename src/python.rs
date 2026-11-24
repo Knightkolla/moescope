@@ -28,7 +28,7 @@ enum Backend {
     /// Fused CUDA kernel + device-resident log.
     #[cfg(feature = "cuda")]
     Gpu {
-        router: GpuRouter,
+        router: Box<GpuRouter>,
         log: TelemetryBuffer,
         biases: HashMap<u16, DeviceBias>,
     },
@@ -109,7 +109,7 @@ fn open_gpu(ordinal: usize, capacity: usize) -> PyResult<Backend> {
     let router = GpuRouter::new(ordinal).map_err(gpu_err)?;
     let log = TelemetryBuffer::new(&router, capacity).map_err(gpu_err)?;
     Ok(Backend::Gpu {
-        router,
+        router: Box::new(router),
         log,
         biases: HashMap::new(),
     })

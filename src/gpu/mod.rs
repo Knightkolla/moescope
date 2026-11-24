@@ -5,7 +5,7 @@ mod raw;
 
 pub use raw::{ForeignLogits, ForeignPtrError, LogitsDtype, cuda_available};
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError};
 use cudarc::nvrtc::{CompileError, CompileOptions, compile_ptx_with_opts};
@@ -236,27 +236,56 @@ fn validate_shape_for_gpu(
     })
 }
 
-/// GPU MoE router: owns the CUDA context, a stream, and the compiled kernels.
-///
-/// Create once per process (NVRTC compilation takes ~100 ms) and reuse.
-pub struct GpuRouter {
-    stream: Arc<CudaStream>,
+/// The kernels of one compiled variant (logits dtype x softmax/sigmoid).
+struct Kernels {
     route_fn: CudaFunction,
     dispatch_log_fn: CudaFunction,
     advance_fn: CudaFunction,
+}
+
+/// GPU MoE router: owns the CUDA context, a stream, and the compiled kernels.
+///
+/// Create once per process and reuse. The kernels are compiled with NVRTC
+/// once per variant (~100 ms each): float32 softmax up front, the others
+/// (float16 / bfloat16 logits, sigmoid gating) on first use.
+pub struct GpuRouter {
+    stream: Arc<CudaStream>,
+    variants: [OnceLock<Kernels>; kernels::NUM_VARIANTS],
 }
 
 impl GpuRouter {
     /// Opens GPU `ordinal` and compiles the routing kernels for it.
     pub fn new(ordinal: usize) -> Result<Self, GpuError> {
         let ctx = open_context(ordinal)?;
-        let module = compile_module(&ctx, &kernels::source())?;
-        Ok(GpuRouter {
+        let router = GpuRouter {
+            stream: ctx.default_stream(),
+            variants: Default::default(),
+        };
+        router.kernels(LogitsDtype::F32, false)?;
+        Ok(router)
+    }
+
+    /// The compiled kernels for logits of `dtype` and (non-)sigmoid gating.
+    fn kernels(&self, dtype: LogitsDtype, sigmoid: bool) -> Result<&Kernels, GpuError> {
+        let code = match dtype {
+            LogitsDtype::F32 => 0,
+            LogitsDtype::F16 => 1,
+            LogitsDtype::BF16 => 2,
+        };
+        let slot = &self.variants[kernels::variant(code, sigmoid)];
+        if let Some(k) = slot.get() {
+            return Ok(k);
+        }
+        let module = compile_module(
+            self.stream.context(),
+            &kernels::source(kernels::variant(code, sigmoid)),
+        )?;
+        let compiled = Kernels {
             route_fn: module.load_function(kernels::ROUTE_KERNEL)?,
             dispatch_log_fn: module.load_function(kernels::DISPATCH_LOG_KERNEL)?,
             advance_fn: module.load_function(kernels::ADVANCE_TOKENS_KERNEL)?,
-            stream: ctx.default_stream(),
-        })
+        };
+        Ok(slot.get_or_init(|| compiled))
     }
 
     /// Copies a per-expert selection bias to the GPU once, for reuse with
@@ -311,7 +340,9 @@ impl GpuRouter {
             .alloc_zeros::<Route>(shape.num_tokens as usize * k)?;
         raw::launch_route(
             &self.stream,
-            &self.route_fn,
+            &self
+                .kernels(LogitsDtype::F32, gate.gating.mode == GateMode::Sigmoid)?
+                .route_fn,
             &logits_dev,
             shape.num_tokens,
             shape.num_experts,
@@ -509,7 +540,8 @@ impl GpuRouter {
         let borrowed =
             raw::borrow_stream(self.stream.context(), stream)?.map_err(GpuError::ForeignPtr)?;
         let stream = borrowed.as_ref().unwrap_or(&self.stream);
-        raw::launch_advance_tokens(stream, &self.advance_fn, &mut log.tokens, n)?;
+        let f = &self.kernels(LogitsDtype::F32, false)?.advance_fn;
+        raw::launch_advance_tokens(stream, f, &mut log.tokens, n)?;
         Ok(())
     }
 
@@ -602,6 +634,7 @@ impl GpuRouter {
             .into());
         }
         check_token_range(token_offset, shape.num_tokens as usize)?;
+        let kernels = self.kernels(logits.dtype(), gate.gating.mode == GateMode::Sigmoid)?;
         let TelemetryBuffer {
             records,
             counters,
@@ -611,7 +644,7 @@ impl GpuRouter {
         } = log;
         raw::launch_route_dispatch_log(
             stream,
-            &self.dispatch_log_fn,
+            &kernels.dispatch_log_fn,
             raw::DispatchLaunch {
                 logits,
                 num_tokens: shape.num_tokens,

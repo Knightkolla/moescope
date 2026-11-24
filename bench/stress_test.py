@@ -223,12 +223,26 @@ def bench(fn, reps=50):
     return (time.perf_counter() - t0) / reps * 1e3
 
 
+CALLS = 55  # bench(): 5 warm-up + 50 timed calls, all logged into one buffer
+
+
+def fresh():
+    """Releases the previous row's buffers (old recorder + torch's cache) so
+    each throughput row starts with the GPU's memory free."""
+    import gc
+
+    moescope.configure(capacity=1, device="cuda")
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def test_throughput():
     print("5) throughput (one call, median of 50)")
     for e, k in ((8, 2), (32, 8), (64, 8), (128, 8)):
         for n in (4096, 65536, 1 << 20):
+            fresh()
             x = torch.randn(n, e, device=DEV)
-            moescope.configure(capacity=60 * n * k, mode="softmax_topk", device="cuda")
+            moescope.configure(capacity=CALLS * n * k, mode="softmax_topk", device="cuda")
             ms = bench(lambda: moescope.route_and_log(x, k=k, layer_id=0))
             moescope.drain_with_stats()
             ms_torch = bench(lambda: torch.softmax(x, -1).topk(k, -1))
@@ -255,8 +269,9 @@ def test_throughput():
         return idx, w / (w.sum(-1, keepdim=True) + 1e-20) * 2.5
 
     for n in (65536, 1 << 20):
+        fresh()
         x = torch.randn(n, e, device=DEV)
-        moescope.configure(capacity=60 * n * k, mode="sigmoid", device="cuda", normalize=True, scale=2.5,
+        moescope.configure(capacity=CALLS * n * k, mode="sigmoid", device="cuda", normalize=True, scale=2.5,
                            n_group=groups, topk_group=top)
         moescope.set_bias(0, bias)
         ms = bench(lambda: moescope.route_and_log(x, k=k, layer_id=0))
@@ -270,8 +285,10 @@ def test_throughput():
 
     # Half-precision logits are read in place (no float32 copy).
     for dt in (torch.float16, torch.bfloat16):
+        x = None
+        fresh()
         x = torch.randn(1 << 20, 64, device=DEV).to(dt)
-        moescope.configure(capacity=60 * (1 << 20) * 8, mode="softmax_topk", device="cuda")
+        moescope.configure(capacity=CALLS * (1 << 20) * 8, mode="softmax_topk", device="cuda")
         ms = bench(lambda: moescope.route_and_log(x, k=8, layer_id=0))
         moescope.drain_with_stats()
         print(f"     E=64   k=8 tokens=1,048,576 {str(dt)[6:]:>8} logits: moescope {ms:7.3f} ms")

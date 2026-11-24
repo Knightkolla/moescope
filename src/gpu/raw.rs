@@ -347,7 +347,7 @@ impl LogitsArg<'_> {
         }
     }
 
-    fn dtype(&self) -> LogitsDtype {
+    pub(super) fn dtype(&self) -> LogitsDtype {
         match self {
             LogitsArg::Owned(_) => LogitsDtype::F32,
             LogitsArg::Foreign(f) => f.dtype,
