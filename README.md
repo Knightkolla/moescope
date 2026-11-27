@@ -122,10 +122,14 @@ with moescope.attach(model) as session:      # finds every MoE router, reads the
     model.generate(**inputs)                 # or training steps, or plain forward passes
 
 log = session.drain()                        # structured numpy array, one row per decision
-log["layer_id"], log["expert_id"], log["gate"], log["token_id"]
+log["token_id"], log["layer_id"], log["expert_id"], log["gate"], log["flags"]
 ```
 
-`attach` hooks each router and logs its own logits: one kernel launch per layer, no recomputation, no host sync. `token_id` counts tokens in processing order, so it keeps working across `generate` steps. Pass `check=True` and `session.parity(log)` compares the log with the experts and gates the model itself chose.
+`attach` hooks each router and logs its own logits: one kernel launch per layer, no recomputation, no host sync. `token_id` counts tokens in processing order, so it keeps working across `generate` steps (in encoder-decoder models, encoder and decoder passes share the counter, and decoder layer ids follow the encoder's).
+
+**Checking the log against what was computed.** With `check=True`, `session.parity(log)` compares the log with what the experts *received*, not with what the router returned: the `top_k_index` each transformers MoE block hands its experts, or, for models with one module per expert, the rows that actually reached each expert module. A (layer, token) matches when the experts that ran on it are exactly its logged, non-dropped decisions.
+
+**Capacity drops.** Switch Transformer and NLLB-MoE give each expert a fixed capacity, and tokens past it are not computed by that expert. `attach` passes the router's own dispatch mask to the kernel, so those decisions are still logged (with the router's gate) and carry `flags & moescope.CAPACITY_DROP`. On Switch Transformer the log matches the experts' actual inputs exactly, drops included.
 
 Supported routing. Families in **bold** are tested against the real transformers code in `tests/python/test_hf_attach.py` (every expert choice identical, gates within 1e-7); the others use routing code identical to a tested family:
 
@@ -134,7 +138,11 @@ Supported routing. Families in **bold** are tested against the real transformers
 | **OLMoE**, **Qwen2/3-MoE**, **DeepSeek-V2** (`greedy`) | softmax over all experts → top-k (± renormalize, × scale) | `softmax_topk` / `topk_softmax` |
 | **Mixtral**, **Granite**, MiniMax, HunYuan | top-k logits → softmax over the k | `topk_softmax` |
 | **DeepSeek-V3**, **GLM-4.5**, **LFM2-MoE**, Kimi K2, dots1 | sigmoid + per-expert selection bias, group-limited top-k, renormalize, × scale | `sigmoid` with bias and groups |
+| **Switch Transformer** | softmax → top-1, per-sequence expert capacity | `softmax_topk`, drops flagged |
+| NLLB-MoE (see below) | top-2 → softmax over the two, expert capacity | `topk_softmax`, drops flagged |
 | Llama 4 (not yet tested: its router doesn't expose the chosen experts) | top-k logits → sigmoid | `sigmoid` |
+
+NLLB-MoE in transformers 5.x does not compute what its router decides: `NllbMoeExperts` one-hot encodes the router's mask a second time, so experts 0 and 1 receive every token and the chosen experts never run (on a tiny model: router picks experts {1, 2, 3}; expert 0 gets 30 rows from 10 tokens, experts 2 and 3 get none). moescope logs the router's decision; `parity()` reports 0% agreement with the experts. `tests/python/test_hf_attach.py` keeps this as a regression test.
 
 `attach` refuses what it can't reproduce exactly (DeepSeek-V2 `group_limited_greedy`, ERNIE-4.5) instead of logging something subtly wrong.
 
@@ -168,7 +176,30 @@ python examples/analyze_routing.py --toy deepseek_v3                     # tiny 
 - **Half precision in place.** float16 and bfloat16 logits are read directly; nothing is converted or copied. For routers that compute `sigmoid` in half precision (LFM2-MoE), moescope rounds the scores the same way torch does, so the logged choice stays identical.
 - **CUDA graphs.** Logging can be captured into a CUDA graph and replayed. Token ids come from a device-side counter that a tiny kernel advances after each forward pass, so every replay logs fresh ids. `attach()` does this automatically on the GPU; with the low-level API, call `recorder.set_device_token_ids(True)` and `moescope.advance_tokens(n)` once per pass.
 
-Not built yet: hooks for vLLM / SGLang's own fused-MoE kernels (they do not call a `torch.nn.Module` router), and filtering of padding tokens in fixed-size graph batches.
+- **Models split over GPUs** (`device_map`): logits from another GPU are copied to the log's GPU in stream order, with no host sync.
+
+### vLLM
+
+```python
+from vllm import LLM
+import moescope.vllm
+
+llm = LLM("ibm-granite/granite-3.1-1b-a400m-instruct", enforce_eager=True)
+session = moescope.vllm.attach(llm)          # hooks run in vLLM's worker process
+llm.generate(prompts)
+log = session.drain()
+```
+
+The hook sits on every MoE layer's `forward(hidden_states, router_logits)`, the interface all vLLM MoE layers share, so it does not depend on vLLM's internal kernel classes. With tensor parallelism only rank 0 logs (router logits are replicated). Limits: it needs `enforce_eager=True` (vLLM compiles the model with `fullgraph=True`, where Python hooks cannot run), `token_id` counts processed tokens across the whole batch rather than per request, and prefix-cache hits are not recomputed, so they are not logged. vLLM may also need `VLLM_ALLOW_INSECURE_SERIALIZATION=1` to send the hook function to its worker.
+
+## Training
+
+```python
+from moescope.monitor import MoescopeCallback
+trainer = Trainer(model=model, args=args, train_dataset=ds, callbacks=[MoescopeCallback(every=100)])
+```
+
+Every `every` steps it reports, per MoE layer and averaged: load imbalance (busiest expert / fair share), dead experts, load entropy, capacity-drop rate, and drift (JS divergence of the expert load from the previous window). Metrics go to Weights & Biases when a run is active, or to any `log_fn(stats, step=...)`. Without the Trainer, wrap a session in `moescope.monitor.RoutingMonitor(session, every=100, log_fn=...)` and call `monitor.step()` after each optimizer step. The log is drained into counts every step, so the buffer only has to hold one step. With gradient checkpointing, the recomputed forward in backward is not logged a second time.
 
 ## Benchmark
 
@@ -225,7 +256,7 @@ Each token is handled by a group of 2–32 threads, sized to the expert count. T
 | `src/telemetry.rs` | the 12-byte `#[repr(C)]` record and a bounded host log |
 | `src/gpu/kernels.rs` | CUDA C compiled at runtime with NVRTC: a lane group per token (warp shuffles), fused route + dispatch + log |
 | `src/gpu/raw.rs` | the **only** module allowed `unsafe`; every block has a safety comment |
-| `src/python.rs`, `python/moescope/` | PyO3 bindings, the numpy / torch API, and `attach()` for Hugging Face models (`hf.py`) |
+| `src/python.rs`, `python/moescope/` | PyO3 bindings, the numpy / torch API, `attach()` for Hugging Face models (`hf.py`), vLLM (`vllm.py`), training metrics (`monitor.py`), usage / pruning / offload analysis (`analysis.py`) |
 
 <details>
 <summary>Design notes</summary>
@@ -233,7 +264,8 @@ Each token is handled by a group of 2–32 threads, sized to the expert count. T
 - **Ties and NaN:** the higher logit wins. On an exact tie the lower expert index wins. NaN ranks below every number.
 - **Appending:** each token reserves its k log slots with one 64-bit `atomicAdd`. Records past capacity are counted as `dropped`, not written.
 - **Foreign pointers:** a torch tensor's address is checked with `cuMemGetAddressRange` and its device ordinal is verified before the kernel reads it. The check works per driver allocation: torch pools tensors, so a wrong length could read a neighbouring tensor, but never unmapped memory.
-- **Limits:** `k ≤ 32`, `num_experts ≤ 65,536`, and every flat index must fit in u32.
+- **Record:** 12 bytes, `token_id u32, layer_id u8, flags u8, expert_id u16, gate f32` (0.3 split the old u16 `layer_id` into `layer_id` + `flags`).
+- **Limits:** `k ≤ 32`, `num_experts ≤ 65,536`, layer ids ≤ 255, and every flat index must fit in u32.
 
 </details>
 
@@ -242,7 +274,7 @@ Each token is handled by a group of 2–32 threads, sized to the expert count. T
 ```sh
 cargo test                                # CPU: router, dispatch, telemetry, property tests
 cargo test --features cuda-13000          # builds the GPU path (GPU tests skip without a driver)
-python -m pytest -q tests/python          # Python bindings + attach() parity on 11 model configurations
+python -m pytest -q tests/python          # bindings, attach() parity on 14 model configurations, vLLM hooks, monitor
 bash scripts/colab.sh cuda-13000          # full GPU suite, ends with "ALL PHASES PASSED"
 bash scripts/colab_models.sh              # GPU parity + stream/graph tests, stress test, routing reports
 ```

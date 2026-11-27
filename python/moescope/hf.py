@@ -179,9 +179,12 @@ def find_routers(model, num_experts: int) -> Dict[int, Any]:
                 w = _router_weight(mod) if mod is not None else None
                 if w is not None and w.shape[0] == num_experts:
                     found[base + i] = mod
-                    mod._moescope_path = path  # where selection_bias() looks
-                    mod._moescope_layer = layer
-                    mod._moescope_stack = owner  # forward of a whole pass
+                    # Plain attributes, not submodules: registering the layer
+                    # under its own router would make the module tree cyclic
+                    # (model.train() / .to() would recurse forever).
+                    object.__setattr__(mod, "_moescope_path", path)  # where selection_bias() looks
+                    object.__setattr__(mod, "_moescope_layer", layer)
+                    object.__setattr__(mod, "_moescope_stack", owner)  # forward of a whole pass
                     break
         if found:
             routers.update(found)
@@ -310,6 +313,8 @@ class Session:
         spec = self.spec
 
         def hook(_mod, _inputs, out):
+            if _in_backward():
+                return  # gradient checkpointing re-running the forward: already logged
             logits, indices, weights = _pick(out, spec)
             if logits is None:
                 raise UnsupportedRouting(f"layer {layer_id}: router output has no [tokens, {spec.num_experts}] logits")
@@ -450,7 +455,7 @@ class Session:
             stacks[id(stack)] = stack
             self._handles.append(router.register_forward_hook(self._router_hook(layer_id, stack)))
             ok = self.check and self._experts_hooks(layer_id, router)
-            router._moescope_experts_checked = ok
+            object.__setattr__(router, "_moescope_experts_checked", ok)
             experts_checked = experts_checked and ok
         if self.check:
             self._reference_source = "experts" if experts_checked else "router"
@@ -484,6 +489,15 @@ class Session:
 
     def __exit__(self, *exc):
         self.detach()
+
+
+def _in_backward() -> bool:
+    """True while autograd runs a backward pass (where activation
+    checkpointing recomputes forwards)."""
+    import torch
+
+    f = getattr(torch._C, "_current_graph_task_id", None)
+    return f is not None and f() != -1
 
 
 def _expert_children(experts, num_experts: int):

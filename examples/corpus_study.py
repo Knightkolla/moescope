@@ -221,6 +221,14 @@ def main():
     split = chunk % 2 == 0
     floor_js = [js_bits(usage(log[split & (pos >= 256)], L, E)[l], usage(log[~split & (pos >= 256)], L, E)[l]) for l in range(L)]
 
+    # Raw per-domain [layer, expert] decision counts and gate mass, for
+    # expert_budget.py (pruning / offload planning).
+    dom = chunk_domain[chunk]
+    flat_d = (dom * L + log["layer_id"]) * E + log["expert_id"]
+    gate_mass = np.bincount(flat_d, weights=log["gate"].astype(np.float64), minlength=4 * L * E).reshape(4, L, E)
+    result_counts = {d: per_chunk[groups[i]].sum(0).astype(np.int64).tolist() for i, d in enumerate(domains)}
+    result_mass = {d: np.round(gate_mass[i], 3).tolist() for i, d in enumerate(domains)}
+
     result = {
         "model": name, "tokens_per_domain": {d: int(len(data[d]) * SEQ) for d in domains},
         "decisions": int(len(log)), "dropped": int(dropped), "moe_layer_ids": layer_ids, "experts": E, "k": spec.k,
@@ -228,6 +236,7 @@ def main():
         "imbalance_per_layer": imbalance, "imbalance_mean_ci": imb_ci, "idle_experts_per_layer": idle,
         "position_js_early_vs_late_per_layer": pos_js, "position_js_noise_floor_per_layer": floor_js,
         "generation_drift": None,
+        "counts_per_domain": result_counts, "gate_mass_per_domain": result_mass,
     }
 
     def save():

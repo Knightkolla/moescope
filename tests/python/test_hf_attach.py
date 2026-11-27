@@ -231,3 +231,14 @@ def test_layer_ids_past_255_are_refused():
     with pytest.raises(OverflowError):
         moescope.route_and_log(np.zeros((1, 4), np.float32), k=1, layer_id=256,
                                recorder=moescope.Recorder(capacity=8, device="cpu"))
+
+
+def test_attach_keeps_the_module_tree_acyclic():
+    """The router must not register its own layer as a submodule: the
+    model has to stay usable (train(), to(), state_dict()) while attached."""
+    model = build("olmoe")
+    n_params = len(model.state_dict())
+    with moescope.attach(model, device="cpu"):
+        model.train()
+        model.eval()
+        assert len(model.state_dict()) == n_params
