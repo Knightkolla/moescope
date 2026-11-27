@@ -229,6 +229,8 @@ llm.generate(prompts)
 log = session.drain()
 ```
 
+Tested with vLLM 0.34 on a T4 (`scripts/vllm_check.sh`, Granite-3.1-1B-A400M): every processed token logged once per layer × top-8 (25,536 records, 0 lost), and on the same prompt vLLM and transformers pick the same expert set for 99.55% of (layer, token) pairs (both fp16, different kernels).
+
 The hook sits on every MoE layer's `forward(hidden_states, router_logits)`, the interface all vLLM MoE layers share, so it does not depend on vLLM's internal kernel classes. With tensor parallelism only rank 0 logs (router logits are replicated). Limits: it needs `enforce_eager=True` (vLLM compiles the model with `fullgraph=True`, where Python hooks cannot run), `token_id` counts processed tokens across the whole batch rather than per request, and prefix-cache hits are not recomputed, so they are not logged. vLLM may also need `VLLM_ALLOW_INSECURE_SERIALIZATION=1` to send the hook function to its worker.
 
 ## Training
