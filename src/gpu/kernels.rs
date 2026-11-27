@@ -37,7 +37,7 @@ const SRC: &str = r#"
 #define NO_EXPERT 0xffffffffu
 #define ALL_GROUPS 0xffffffffu
 
-// Mirrors gpu::raw::GateParams (48 bytes). mode: 0 = softmax_topk,
+// Mirrors gpu::raw::GateParams (56 bytes). mode: 0 = softmax_topk,
 // 1 = topk_softmax, 2 = sigmoid. num_groups == 1 means no group limit.
 // logits_dtype: 0 = float32, 1 = float16, 2 = bfloat16.
 // bias is a [num_experts] device array or null (sigmoid mode only).
@@ -45,6 +45,9 @@ const SRC: &str = r#"
 // a captured CUDA graph logs fresh ids on each replay. round_biased: the
 // model stores its bias in the logits' half precision, so score + bias is
 // itself rounded to that precision before ranking (as torch does).
+// kept_mask, if not null, is the model's [num_tokens, num_experts] dispatch
+// mask after capacity (nonzero = the expert computed the token); a logged
+// decision whose mask entry is 0 gets flags |= CAPACITY_DROP.
 struct GateParams {
     int mode;
     unsigned int num_groups;
@@ -56,7 +59,10 @@ struct GateParams {
     const unsigned long long* token_base;
     int round_biased;
     int pad;
+    const unsigned char* kept_mask;
 };
+
+#define CAPACITY_DROP 1
 
 // One token's logits, in the variant's precision DT.
 struct Row {
@@ -92,7 +98,8 @@ struct RouteEntry {
 // Mirrors crate::telemetry::TelemetryRecord (12 bytes, no padding).
 struct TelemetryRecord {
     unsigned int token_id;
-    unsigned short layer_id;
+    unsigned char layer_id;
+    unsigned char flags;
     unsigned short expert_id;
     float gate;
 };
@@ -402,7 +409,8 @@ extern "C" __global__ void moe_route_dispatch_log(
         unsigned long long idx = base + j;
         if (idx < capacity) {
             log[idx].token_id = (unsigned int)(token_base + token_offset + t);
-            log[idx].layer_id = (unsigned short)layer_id;
+            log[idx].layer_id = (unsigned char)layer_id;
+            log[idx].flags = (gp.kept_mask && !gp.kept_mask[t * num_experts + e]) ? CAPACITY_DROP : 0;
             log[idx].expert_id = (unsigned short)e;
             log[idx].gate = gate;
         } else {

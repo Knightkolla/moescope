@@ -140,3 +140,94 @@ def test_unsupported_routing_is_refused():
                                         topk_method="group_limited_greedy", n_group=2, topk_group=1)
     with pytest.raises(moescope.hf.UnsupportedRouting):
         moescope.routing_spec(cfg)
+
+
+# -- capacity-factor models: tokens past an expert's capacity are dropped ----
+
+def build_capacity(family, capacity=4):
+    T = transformers
+    torch.manual_seed(0)
+    if family == "switch_transformers":
+        cfg = T.SwitchTransformersConfig(vocab_size=256, d_model=32, d_kv=8, d_ff=64, num_heads=4, num_layers=2,
+                                         num_decoder_layers=2, num_experts=4, expert_capacity=capacity,
+                                         encoder_sparse_step=1, decoder_sparse_step=1, decoder_start_token_id=0)
+        return T.SwitchTransformersForConditionalGeneration(cfg)
+    if family == "nllb_moe":
+        cfg = T.NllbMoeConfig(vocab_size=256, d_model=32, encoder_layers=2, decoder_layers=2, encoder_attention_heads=4,
+                              decoder_attention_heads=4, encoder_ffn_dim=64, decoder_ffn_dim=64, num_experts=4,
+                              expert_capacity=capacity, moe_eval_capacity_token_fraction=0.0, encoder_sparse_step=1,
+                              decoder_sparse_step=1, max_position_embeddings=128, pad_token_id=1)
+        return T.NllbMoeForConditionalGeneration(cfg)
+    raise ValueError(family)
+
+
+def _run_capacity(family, device="cpu"):
+    model = build_capacity(family).to(device).eval()
+    src = torch.randint(3, 256, (2, 24), device=model.device)
+    tgt = torch.randint(3, 256, (2, 5), device=model.device)
+    with moescope.attach(model, check=True, device=device) as session:
+        with torch.no_grad():
+            model(input_ids=src, decoder_input_ids=tgt)
+    log, dropped = session.drain_with_stats()
+    return session, log, dropped
+
+
+@pytest.mark.parametrize("family", ["switch_transformers", "nllb_moe"])
+def test_capacity_drops_are_flagged_from_the_routers_dispatch_mask(family):
+    if DEVICE.startswith("cuda") and not moescope.cuda_available():
+        pytest.skip("no CUDA")
+    session, log, dropped = _run_capacity(family, DEVICE)
+    spec = session.spec
+    assert dropped == 0
+    n_enc, n_dec = 2 * 24, 2 * 5
+    enc_layers = [l for l in session.routers if l < 2]
+    dec_layers = [l for l in session.routers if l >= 2]
+    assert enc_layers == [0, 1] and dec_layers == [2, 3], session.routers.keys()
+    # Every routing decision is logged, dropped or not; encoder and decoder
+    # passes get consecutive token ids.
+    assert len(log) == (n_enc * len(enc_layers) + n_dec * len(dec_layers)) * spec.k
+    assert set(log["token_id"][log["layer_id"] < 2].tolist()) == set(range(n_enc))
+    assert set(log["token_id"][log["layer_id"] >= 2].tolist()) == set(range(n_enc, n_enc + n_dec))
+    drops = (log["flags"] & moescope.CAPACITY_DROP) != 0
+    assert drops.any(), "capacity 4 with 48 tokens on 4 experts must overflow"
+    # Per (layer, expert), at most `capacity` tokens survive in the encoder
+    # (Switch counts capacity per sequence, NLLB per batch).
+    per_seq = family == "switch_transformers"
+    kept = log[~drops & (log["layer_id"] < 2)]
+    seq = kept["token_id"] // 24 if per_seq else np.zeros(len(kept), np.int64)
+    _, counts = np.unique(np.stack([kept["layer_id"], kept["expert_id"], seq]), axis=1, return_counts=True)
+    assert counts.max() <= 4
+
+
+def test_switch_log_matches_what_the_experts_computed():
+    """Switch Transformer: parity is checked against the rows each expert
+    module really received, so a dropped token must be flagged and a kept
+    one must have reached its expert."""
+    if DEVICE.startswith("cuda") and not moescope.cuda_available():
+        pytest.skip("no CUDA")
+    session, log, _ = _run_capacity("switch_transformers", DEVICE)
+    par = session.parity(log)
+    assert par["source"] == "experts"
+    assert par["capacity_drops"] > 0
+    assert par["match_rate"] == 1.0, par
+    assert par["max_gate_err"] < 1e-5, par
+
+
+def test_nllb_moe_experts_disagree_with_the_router_in_transformers_5():
+    """transformers 5.x NLLB-MoE one-hot encodes the router's (already
+    one-hot) top-1 mask again, so experts 0 and 1 receive the tokens instead
+    of the experts the router chose. moescope logs the router's decision; the
+    experts-side parity check is what exposes the mismatch. If this starts
+    failing, transformers has fixed it: flip the assertion."""
+    if DEVICE.startswith("cuda") and not moescope.cuda_available():
+        pytest.skip("no CUDA")
+    session, log, _ = _run_capacity("nllb_moe", DEVICE)
+    par = session.parity(log)
+    assert par["source"] == "experts"
+    assert par["match_rate"] < 0.5, par
+
+
+def test_layer_ids_past_255_are_refused():
+    with pytest.raises(OverflowError):
+        moescope.route_and_log(np.zeros((1, 4), np.float32), k=1, layer_id=256,
+                               recorder=moescope.Recorder(capacity=8, device="cpu"))

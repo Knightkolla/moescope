@@ -214,6 +214,17 @@ fn validate_for_gpu(logits: &[f32], num_experts: usize, k: usize) -> Result<Batc
     validate_shape_for_gpu(num_tokens, num_experts, k)
 }
 
+/// A host dispatch mask must have one byte per (token, expert).
+fn check_kept_len(len: Option<usize>, shape: BatchShape) -> Result<(), GpuError> {
+    let expected = shape.num_tokens as usize * shape.num_experts as usize;
+    match len {
+        Some(found) if found != expected => {
+            Err(TelemetryError::KeptMaskShape { expected, found }.into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Shape-only validation, for logits that live on the device.
 fn validate_shape_for_gpu(
     num_tokens: usize,
@@ -371,7 +382,7 @@ impl GpuRouter {
         num_experts: usize,
         k: usize,
         gate: impl Into<GpuGate<'g>>,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
         log: &mut TelemetryBuffer,
     ) -> Result<DeviceDispatch, GpuError> {
@@ -412,7 +423,7 @@ impl GpuRouter {
         num_experts: usize,
         k: usize,
         gate: impl Into<GpuGate<'g>>,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
         log: &mut TelemetryBuffer,
     ) -> Result<DeviceDispatch, GpuError> {
@@ -463,7 +474,7 @@ impl GpuRouter {
         num_experts: usize,
         k: usize,
         gate: impl Into<GpuGate<'g>>,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
         log: &mut TelemetryBuffer,
     ) -> Result<(), GpuError> {
@@ -475,7 +486,37 @@ impl GpuRouter {
         }
         let logits_dev = self.stream.clone_htod(logits)?;
         let logits = raw::LogitsArg::Owned(&logits_dev);
-        self.launch(logits, shape, gate, layer_id, token_offset, log, None)
+        self.launch(logits, shape, gate, layer_id, token_offset, log, None, None)
+    }
+
+    /// [`log_only`](Self::log_only) plus the model's dispatch mask after
+    /// capacity (`kept[t * num_experts + e] != 0` iff expert `e` computed
+    /// token `t`): decisions the experts never computed are logged with
+    /// [`CAPACITY_DROP`](crate::telemetry::CAPACITY_DROP) set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_only_masked<'g>(
+        &self,
+        logits: &[f32],
+        num_experts: usize,
+        k: usize,
+        gate: impl Into<GpuGate<'g>>,
+        layer_id: u8,
+        token_offset: u32,
+        kept: Option<&[u8]>,
+        log: &mut TelemetryBuffer,
+    ) -> Result<(), GpuError> {
+        let gate = gate.into();
+        let shape = validate_for_gpu(logits, num_experts, k)?;
+        gate.validate(num_experts, k)?;
+        check_kept_len(kept.map(<[u8]>::len), shape)?;
+        if shape.num_tokens == 0 {
+            return Ok(());
+        }
+        let logits_dev = self.stream.clone_htod(logits)?;
+        let kept_dev = kept.map(|m| self.stream.clone_htod(m)).transpose()?;
+        let logits = raw::LogitsArg::Owned(&logits_dev);
+        let kept = kept_dev.as_ref().map(raw::MaskArg::Owned);
+        self.launch(logits, shape, gate, layer_id, token_offset, log, None, kept)
     }
 
     /// Zero-copy [`log_only`](Self::log_only) for logits already on the GPU,
@@ -488,6 +529,10 @@ impl GpuRouter {
     /// (torch: `torch.cuda.current_stream().cuda_stream`), or 0 for the
     /// legacy default stream. Launching on the model's own stream needs no
     /// host synchronization and works inside CUDA-graph capture.
+    ///
+    /// `kept_ptr`, if not 0, is the device address of the model's u8
+    /// dispatch mask after capacity, `[num_tokens, num_experts]` (see
+    /// [`log_only_masked`](Self::log_only_masked)), validated like the logits.
     #[allow(clippy::too_many_arguments)]
     pub fn log_only_device<'g>(
         &self,
@@ -497,10 +542,11 @@ impl GpuRouter {
         num_experts: usize,
         k: usize,
         gate: impl Into<GpuGate<'g>>,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
         log: &mut TelemetryBuffer,
         stream: u64,
+        kept_ptr: u64,
     ) -> Result<(), GpuError> {
         let gate = gate.into();
         let shape = validate_shape_for_gpu(num_tokens, num_experts, k)?;
@@ -511,6 +557,13 @@ impl GpuRouter {
         let ctx = self.stream.context();
         let foreign = raw::borrow_foreign(ctx, logits_ptr, num_tokens * num_experts, dtype)?
             .map_err(GpuError::ForeignPtr)?;
+        let kept = match kept_ptr {
+            0 => None,
+            p => Some(
+                raw::borrow_foreign_bytes(ctx, p, num_tokens * num_experts)?
+                    .map_err(GpuError::ForeignPtr)?,
+            ),
+        };
         let borrowed = raw::borrow_stream(ctx, stream)?.map_err(GpuError::ForeignPtr)?;
         let stream = borrowed.as_ref().unwrap_or(&self.stream);
         let logits = raw::LogitsArg::Foreign(foreign);
@@ -523,6 +576,7 @@ impl GpuRouter {
             token_offset,
             log,
             None,
+            kept,
         )
     }
 
@@ -552,7 +606,7 @@ impl GpuRouter {
         logits: raw::LogitsArg<'_>,
         shape: BatchShape,
         gate: GpuGate<'_>,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
         log: &mut TelemetryBuffer,
     ) -> Result<DeviceDispatch, GpuError> {
@@ -584,6 +638,7 @@ impl GpuRouter {
             token_offset,
             log,
             Some(outputs),
+            None,
         )?;
         Ok(out)
     }
@@ -595,10 +650,11 @@ impl GpuRouter {
         logits: raw::LogitsArg<'_>,
         shape: BatchShape,
         gate: GpuGate<'_>,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
         log: &mut TelemetryBuffer,
         dispatch: Option<raw::DispatchOutputs<'_>>,
+        kept: Option<raw::MaskArg<'_>>,
     ) -> Result<(), GpuError> {
         let stream = self.stream.clone();
         self.launch_on(
@@ -610,6 +666,7 @@ impl GpuRouter {
             token_offset,
             log,
             dispatch,
+            kept,
         )
     }
 
@@ -622,10 +679,11 @@ impl GpuRouter {
         logits: raw::LogitsArg<'_>,
         shape: BatchShape,
         gate: GpuGate<'_>,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
         log: &mut TelemetryBuffer,
         dispatch: Option<raw::DispatchOutputs<'_>>,
+        kept: Option<raw::MaskArg<'_>>,
     ) -> Result<(), GpuError> {
         if shape.num_experts as usize > u16::MAX as usize + 1 {
             return Err(TelemetryError::ExpertIdOverflow {
@@ -655,6 +713,7 @@ impl GpuRouter {
                 layer_id: layer_id as u32,
                 token_offset,
                 dispatch,
+                kept,
                 log: records,
                 log_counters: counters,
             },

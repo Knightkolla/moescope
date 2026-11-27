@@ -37,7 +37,7 @@ def rec():
 
 def test_dtype_is_12_bytes():
     assert moescope.RECORD_DTYPE.itemsize == 12
-    assert moescope.RECORD_DTYPE.names == ("token_id", "layer_id", "expert_id", "gate")
+    assert moescope.RECORD_DTYPE.names == ("token_id", "layer_id", "flags", "expert_id", "gate")
 
 
 @pytest.mark.parametrize("mode", ["softmax_topk", "topk_softmax"])
@@ -128,3 +128,16 @@ def test_bad_device_pointer_is_rejected_not_dereferenced():
     # segments), so overrun far past any plausible segment: 64M x 8 floats.
     with pytest.raises(ValueError, match="OutOfRange"):
         rec.route_and_log_device(small.data_ptr(), 64 << 20, 8, 2, 0)
+
+
+def test_kept_mask_flags_capacity_drops_on_cpu():
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((500, 16)).astype(np.float32)
+    kept = rng.random((500, 16)) < 0.6
+    rec = moescope.Recorder(capacity=500 * 4, device="cpu")
+    moescope.route_and_log(x, k=4, layer_id=3, recorder=rec, kept=kept)
+    log = moescope.drain(rec)
+    want = ~kept[log["token_id"].astype(np.int64), log["expert_id"].astype(np.int64)]
+    assert np.array_equal((log["flags"] & moescope.CAPACITY_DROP) != 0, want) and want.any()
+    with pytest.raises(ValueError):
+        moescope.route_and_log(x, k=4, layer_id=3, recorder=rec, kept=kept[:10].ravel())

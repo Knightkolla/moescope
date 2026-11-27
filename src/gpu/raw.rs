@@ -73,8 +73,8 @@ impl LogitsDtype {
 
 /// Kernel-side parameters, passed by value. Mirrors `GateParams` in the
 /// CUDA source: { int, uint, uint, int, float, int, const float*,
-/// const unsigned long long*, int, int }, 48 bytes, pointers 8-byte aligned
-/// at 24, 32.
+/// const unsigned long long*, int, int, const unsigned char* }, 56 bytes,
+/// pointers 8-byte aligned at 24, 32, 48.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct GateParams {
@@ -88,8 +88,9 @@ struct GateParams {
     token_base: CUdeviceptr,
     round_biased: i32,
     pad: i32,
+    kept_mask: CUdeviceptr,
 }
-const _: () = assert!(std::mem::size_of::<GateParams>() == 48);
+const _: () = assert!(std::mem::size_of::<GateParams>() == 56);
 
 // SAFETY: `GateParams` is `#[repr(C)]` plain data (integers, a float and a
 // device address) with the same layout as the CUDA struct (size asserted).
@@ -141,14 +142,38 @@ fn ptr_of<'a, T>(
     }
 }
 
+/// The model's `[num_tokens, num_experts]` dispatch mask (u8, nonzero =
+/// computed), already length-checked by the caller.
+pub(super) enum MaskArg<'a> {
+    /// Uploaded from host memory.
+    Owned(&'a CudaSlice<u8>),
+    /// Another library's device memory, validated by [`borrow_foreign_bytes`].
+    Foreign { ptr: u64, len: usize },
+}
+
+impl MaskArg<'_> {
+    fn len(&self) -> usize {
+        match self {
+            MaskArg::Owned(s) => s.len(),
+            MaskArg::Foreign { len, .. } => *len,
+        }
+    }
+}
+
 fn push_gate<'a>(
     stream: &'a CudaStream,
     gate: GateArg<'a>,
     logits_dtype: LogitsDtype,
     token_base: Option<&'a CudaSlice<u64>>,
-) -> (GateParams, [Guard<'a>; 2]) {
+    kept: Option<&'a MaskArg<'a>>,
+) -> (GateParams, [Guard<'a>; 3]) {
     let (bias, bias_guard) = ptr_of(gate.bias, stream);
     let (token_base, token_guard) = ptr_of(token_base, stream);
+    let (kept_mask, kept_guard) = match kept {
+        Some(MaskArg::Owned(b)) => ptr_of(Some(*b), stream),
+        Some(MaskArg::Foreign { ptr, .. }) => (*ptr, None),
+        None => (0, None),
+    };
     let g = gate.gating;
     let (num_groups, top_groups) = g
         .groups
@@ -168,8 +193,9 @@ fn push_gate<'a>(
         token_base,
         round_biased: gate.round_biased as i32,
         pad: 0,
+        kept_mask,
     };
-    (params, [bias_guard, token_guard])
+    (params, [bias_guard, token_guard, kept_guard])
 }
 
 /// Threads per block. A block holds `BLOCK / lanes` tokens; every lane keeps
@@ -211,7 +237,7 @@ pub(super) fn launch_route(
     assert!(k >= 1 && k as usize <= super::kernels::MAX_K && num_tokens > 0);
     gate.check(num_experts as usize);
     let lanes = super::kernels::lanes_per_token(num_experts);
-    let (params, _guards) = push_gate(stream, gate, LogitsDtype::F32, None);
+    let (params, _guards) = push_gate(stream, gate, LogitsDtype::F32, None, None);
     let mut launch = stream.launch_builder(func);
     launch
         .arg(logits)
@@ -292,10 +318,29 @@ pub(super) fn borrow_foreign(
     len: usize,
     dtype: LogitsDtype,
 ) -> Result<Result<ForeignLogits, ForeignPtrError>, cudarc::driver::DriverError> {
+    Ok(check_foreign(ctx, ptr, len, dtype.size())?.map(|()| ForeignLogits { ptr, len, dtype }))
+}
+
+/// Validates `len` bytes of foreign device memory at `ptr` (a u8 mask),
+/// exactly like [`borrow_foreign`].
+pub(super) fn borrow_foreign_bytes<'a>(
+    ctx: &CudaContext,
+    ptr: u64,
+    len: usize,
+) -> Result<Result<MaskArg<'a>, ForeignPtrError>, cudarc::driver::DriverError> {
+    Ok(check_foreign(ctx, ptr, len, 1)?.map(|()| MaskArg::Foreign { ptr, len }))
+}
+
+fn check_foreign(
+    ctx: &CudaContext,
+    ptr: u64,
+    len: usize,
+    elem: usize,
+) -> Result<Result<(), ForeignPtrError>, cudarc::driver::DriverError> {
     if ptr == 0 {
         return Ok(Err(ForeignPtrError::Null));
     }
-    if !ptr.is_multiple_of(dtype.size() as u64) {
+    if !ptr.is_multiple_of(elem as u64) {
         return Ok(Err(ForeignPtrError::Misaligned));
     }
     ctx.bind_to_thread()?;
@@ -323,12 +368,12 @@ pub(super) fn borrow_foreign(
             found: ordinal,
         }));
     }
-    let needed = len.saturating_mul(dtype.size());
+    let needed = len.saturating_mul(elem);
     let available = (base as usize + size).saturating_sub(ptr as usize);
     if needed > available {
         return Ok(Err(ForeignPtrError::OutOfRange { needed, available }));
     }
-    Ok(Ok(ForeignLogits { ptr, len, dtype }))
+    Ok(Ok(()))
 }
 
 /// Where a kernel reads its logits from.
@@ -423,6 +468,9 @@ pub(super) struct DispatchLaunch<'a> {
     pub token_offset: u32,
     /// `None` = telemetry-only: the kernel skips routes/dispatch entirely.
     pub dispatch: Option<DispatchOutputs<'a>>,
+    /// The model's dispatch mask after capacity, `num_tokens * num_experts`
+    /// bytes, or None (every decision counts as computed).
+    pub kept: Option<MaskArg<'a>>,
     pub log: &'a mut CudaSlice<TelemetryRecord>,
     pub log_counters: &'a mut CudaSlice<u64>,
 }
@@ -453,7 +501,10 @@ pub(super) fn launch_route_dispatch_log(
         assert_eq!(d.gathered.len(), n * e);
     }
     assert_eq!(p.log_counters.len(), 2);
-    assert!(e <= u16::MAX as usize + 1 && p.layer_id <= u16::MAX as u32);
+    assert!(e <= u16::MAX as usize + 1 && p.layer_id <= u8::MAX as u32);
+    if let Some(m) = &p.kept {
+        assert_eq!(m.len(), n * e, "kept mask length");
+    }
     assert!(p.token_offset as u64 + n as u64 <= u32::MAX as u64 + 1);
     let capacity = p.log.len() as u64;
     let lanes = super::kernels::lanes_per_token(p.num_experts);
@@ -461,7 +512,13 @@ pub(super) fn launch_route_dispatch_log(
     if let Some(tb) = p.token_base {
         assert_eq!(tb.len(), 1);
     }
-    let (params, _guards) = push_gate(stream, p.gate, p.logits.dtype(), p.token_base);
+    let (params, _guards) = push_gate(
+        stream,
+        p.gate,
+        p.logits.dtype(),
+        p.token_base,
+        p.kept.as_ref(),
+    );
 
     let mut launch = stream.launch_builder(func);
     let foreign_ptr: CUdeviceptr;
@@ -513,6 +570,9 @@ pub(super) fn launch_route_dispatch_log(
     // * GateParams.bias is null or a live device buffer of exactly E floats
     //   (gate.check), read only at expert indices < E; token_base is null or
     //   a live 1-element u64 buffer (asserted), only read;
+    // * GateParams.kept_mask is null or n*E live bytes (asserted; a foreign
+    //   mask was range-checked by borrow_foreign_bytes), read only at
+    //   t*E + e with t < n, e < E;
     // * logits are read as GateParams.logits_dtype, the dtype the foreign
     //   pointer was validated for (n*E elements of that size);
     // * log is written only at idx < capacity == log.len();

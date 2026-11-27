@@ -46,6 +46,19 @@ def test_half_precision_logits_are_read_natively(dtype):
     assert np.abs(gates - ref_gates).max() < 1e-5
 
 
+@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.int64, torch.float16])
+def test_kept_mask_on_device_sets_capacity_drop(mask_dtype):
+    n = 3000
+    x = torch.randn(n, E, device="cuda")
+    kept = torch.rand(n, E, device="cuda") < 0.7
+    rec = moescope.Recorder(capacity=n * K, mode="softmax_topk", device="cuda")
+    moescope.route_and_log(x, k=K, layer_id=7, recorder=rec, kept=kept.to(mask_dtype))
+    log, _ = moescope.drain_with_stats(rec)
+    want = ~kept.cpu().numpy()[log["token_id"].astype(np.int64), log["expert_id"].astype(np.int64)]
+    got = (log["flags"] & moescope.CAPACITY_DROP) != 0
+    assert len(log) == n * K and np.array_equal(got, want) and want.any()
+
+
 def test_logits_from_a_non_blocking_stream_need_no_sync():
     n = 8192
     rec = moescope.Recorder(capacity=n * K, mode="softmax_topk", device="cuda")
@@ -89,3 +102,46 @@ def test_cuda_graph_replays_log_fresh_token_ids():
     assert np.array_equal(tokens, np.arange(replays * n)), "each replay must get new token ids"
     for r, d in enumerate(data):
         assert same_choice(d, ids[r * n : (r + 1) * n]).all(), f"replay {r} logged the wrong experts"
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+def test_model_split_over_two_gpus_logs_without_host_sync(monkeypatch):
+    """device_map-style split: layer 1's router runs on cuda:1, the log lives
+    on cuda:0. The hook must not synchronize, and the log must equal a
+    checked run's."""
+    transformers = pytest.importorskip("transformers")
+    accelerate = pytest.importorskip("accelerate")
+    torch.manual_seed(0)
+    cfg = transformers.OlmoeConfig(vocab_size=256, hidden_size=64, intermediate_size=64, num_hidden_layers=2,
+                                   num_attention_heads=4, num_key_value_heads=4, num_experts=16,
+                                   num_experts_per_tok=4, max_position_embeddings=128, pad_token_id=0)
+    model = transformers.OlmoeForCausalLM(cfg).eval()
+    device_map = {"model.embed_tokens": 0, "model.rotary_emb": 0, "model.layers.0": 0,
+                  "model.layers.1": 1, "model.norm": 1, "lm_head": 1}
+    model = accelerate.dispatch_model(model, device_map=device_map)
+    ids = torch.randint(3, 256, (2, 64), device="cuda:0")
+
+    def run(check):
+        with moescope.attach(model, check=check, device="cuda:0") as s:
+            with torch.no_grad():
+                model(input_ids=ids)
+        return s, s.drain()
+
+    ref_session, ref = run(check=True)
+    par = ref_session.parity(ref)
+    assert par["match_rate"] == 1.0, par
+
+    calls = []
+    real = torch.cuda.Stream.synchronize
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: calls.append("device"))
+    monkeypatch.setattr(torch.cuda.Stream, "synchronize", lambda self: (calls.append("stream"), real(self)))
+    with moescope.attach(model, device="cuda:0") as s:
+        with torch.no_grad():
+            model(input_ids=ids)
+    assert calls == [], f"hook synchronized: {calls}"
+    monkeypatch.undo()
+    log = s.drain()
+    key = lambda x: np.sort(x, order=["layer_id", "token_id", "expert_id"])  # noqa: E731
+    a, b = key(log), key(ref)
+    assert np.array_equal(a[["token_id", "layer_id", "expert_id"]], b[["token_id", "layer_id", "expert_id"]])
+    assert np.abs(a["gate"] - b["gate"]).max() < 1e-6

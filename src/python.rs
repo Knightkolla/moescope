@@ -13,7 +13,7 @@ use pyo3::types::PyBytes;
 use std::collections::HashMap;
 
 use crate::router::{GateMode, Gating, GroupLimit, route_batch_with};
-use crate::telemetry::{Drained, HostTelemetry, TelemetryRecord};
+use crate::telemetry::{CAPACITY_DROP, Drained, HostTelemetry, KeptMask, TelemetryRecord};
 
 #[cfg(feature = "cuda")]
 use crate::gpu::{DeviceBias, GpuError, GpuGate, GpuRouter, TelemetryBuffer};
@@ -23,14 +23,14 @@ enum Backend {
     /// Reference router + bounded host log. Always available.
     Cpu {
         log: HostTelemetry,
-        biases: HashMap<u16, Vec<f32>>,
+        biases: HashMap<u8, Vec<f32>>,
     },
     /// Fused CUDA kernel + device-resident log.
     #[cfg(feature = "cuda")]
     Gpu {
         router: Box<GpuRouter>,
         log: TelemetryBuffer,
-        biases: HashMap<u16, DeviceBias>,
+        biases: HashMap<u8, DeviceBias>,
     },
 }
 
@@ -130,12 +130,13 @@ fn native_cuda_available() -> bool {
 }
 
 /// Serializes records as little-endian bytes matching the numpy dtype
-/// `[('token_id','<u4'),('layer_id','<u2'),('expert_id','<u2'),('gate','<f4')]`.
+/// `[('token_id','<u4'),('layer_id','u1'),('flags','u1'),('expert_id','<u2'),('gate','<f4')]`.
 fn records_to_bytes(records: &[TelemetryRecord]) -> Vec<u8> {
     let mut out = Vec::with_capacity(std::mem::size_of_val(records));
     for r in records {
         out.extend_from_slice(&r.token_id.to_le_bytes());
-        out.extend_from_slice(&r.layer_id.to_le_bytes());
+        out.push(r.layer_id);
+        out.push(r.flags);
         out.extend_from_slice(&r.expert_id.to_le_bytes());
         out.extend_from_slice(&r.gate.to_le_bytes());
     }
@@ -242,7 +243,7 @@ impl Recorder {
     fn set_bias(
         &mut self,
         py: Python<'_>,
-        layer_id: u16,
+        layer_id: u8,
         bias: PyBuffer<f32>,
         half: bool,
     ) -> PyResult<()> {
@@ -277,14 +278,19 @@ impl Recorder {
 
     /// Routes host logits (any C-contiguous float32 buffer of shape
     /// `[num_tokens, num_experts]`) and appends every decision to the log.
-    #[pyo3(signature = (logits, k, layer_id, token_offset = 0))]
+    ///
+    /// `kept`: optional C-contiguous uint8 `[num_tokens, num_experts]`
+    /// dispatch mask after capacity (nonzero = the expert computed the
+    /// token); decisions it marks 0 are logged with flag CAPACITY_DROP.
+    #[pyo3(signature = (logits, k, layer_id, token_offset = 0, kept = None))]
     fn route_and_log(
         &mut self,
         py: Python<'_>,
         logits: PyBuffer<f32>,
         k: usize,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
+        kept: Option<PyBuffer<u8>>,
     ) -> PyResult<()> {
         let &[num_tokens, num_experts] = logits.shape() else {
             return Err(value_err(format!(
@@ -297,6 +303,17 @@ impl Recorder {
         }
         let host = logits.to_vec(py)?;
         debug_assert_eq!(host.len(), num_tokens * num_experts);
+        let kept = match kept {
+            Some(m) => {
+                if !m.is_c_contiguous() || m.item_count() != num_tokens * num_experts {
+                    return Err(value_err(format!(
+                        "kept must be a C-contiguous uint8 [{num_tokens}, {num_experts}] mask"
+                    )));
+                }
+                Some(m.to_vec(py)?)
+            }
+            None => None,
+        };
         let gating = self.gating;
         let backend = &mut self.backend;
         py.detach(move || match backend {
@@ -304,7 +321,8 @@ impl Recorder {
                 let bias = biases.get(&layer_id).map(Vec::as_slice);
                 let routes =
                     route_batch_with(&host, num_experts, k, &gating, bias).map_err(value_err)?;
-                log.log_routes(&routes, k, layer_id, token_offset)
+                let kept = kept.as_deref().map(|mask| KeptMask { mask, num_experts });
+                log.log_routes_masked(&routes, k, layer_id, token_offset, kept)
                     .map_err(value_err)
             }
             #[cfg(feature = "cuda")]
@@ -318,7 +336,16 @@ impl Recorder {
                     bias: biases.get(&layer_id),
                 };
                 router
-                    .log_only(&host, num_experts, k, gate, layer_id, token_offset, log)
+                    .log_only_masked(
+                        &host,
+                        num_experts,
+                        k,
+                        gate,
+                        layer_id,
+                        token_offset,
+                        kept.as_deref(),
+                        log,
+                    )
                     .map_err(gpu_err)
             }
         })
@@ -331,9 +358,11 @@ impl Recorder {
     /// `torch.cuda.current_stream().cuda_stream`; 0 = legacy default), so no
     /// host sync is needed and the launch can be captured in a CUDA graph.
     /// The pointer and stream are validated with the CUDA driver before use.
+    /// `kept_ptr` (0 = none) is the device address of a uint8
+    /// `[num_tokens, num_experts]` dispatch mask, as in `route_and_log`.
     /// GPU backend only.
     #[pyo3(signature = (ptr, num_tokens, num_experts, k, layer_id, token_offset = 0,
-                        dtype = "float32", stream = 0))]
+                        dtype = "float32", stream = 0, kept_ptr = 0))]
     #[allow(clippy::too_many_arguments)]
     fn route_and_log_device(
         &mut self,
@@ -342,10 +371,11 @@ impl Recorder {
         num_tokens: usize,
         num_experts: usize,
         k: usize,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
         dtype: &str,
         stream: u64,
+        kept_ptr: u64,
     ) -> PyResult<()> {
         let gating = self.gating;
         match &mut self.backend {
@@ -360,6 +390,7 @@ impl Recorder {
                     token_offset,
                     dtype,
                     stream,
+                    kept_ptr,
                     gating,
                 );
                 Err(PyRuntimeError::new_err(
@@ -390,6 +421,7 @@ impl Recorder {
                             token_offset,
                             log,
                             stream,
+                            kept_ptr,
                         )
                         .map_err(gpu_err)
                 })
@@ -459,5 +491,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cuda_available, m)?)?;
     m.add_function(wrap_pyfunction!(built_with_cuda, m)?)?;
     m.add("RECORD_ITEMSIZE", std::mem::size_of::<TelemetryRecord>())?;
+    m.add("CAPACITY_DROP", CAPACITY_DROP)?;
     Ok(())
 }

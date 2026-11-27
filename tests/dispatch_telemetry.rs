@@ -37,6 +37,7 @@ fn records_carry_token_layer_expert_gate() {
         TelemetryRecord {
             token_id: 100,
             layer_id: 3,
+            flags: 0,
             expert_id: 5,
             gate: 0.9
         }
@@ -46,6 +47,7 @@ fn records_carry_token_layer_expert_gate() {
         TelemetryRecord {
             token_id: 101,
             layer_id: 3,
+            flags: 0,
             expert_id: 0,
             gate: 0.0
         }
@@ -104,11 +106,40 @@ proptest! {
         let mut log = HostTelemetry::new(cap);
         let routes = vec![r(1, 0.5); tokens * 2];
         for b in 0..batches {
-            log.log_routes(&routes, 2, b as u16, 0).unwrap();
+            log.log_routes(&routes, 2, b as u8, 0).unwrap();
         }
         let d = log.drain();
         let total = batches * tokens * 2;
         prop_assert_eq!(d.records.len(), total.min(cap));
         prop_assert_eq!(d.records.len() as u64 + d.dropped, total as u64);
     }
+}
+
+#[test]
+fn kept_mask_flags_decisions_the_experts_never_computed() {
+    use moescope::telemetry::{CAPACITY_DROP, KeptMask, records_for_masked};
+    // 2 tokens, k = 2, 3 experts. Token 0 -> {2, 0}, token 1 -> {1, 2}.
+    let routes = [r(2, 0.6), r(0, 0.4), r(1, 0.7), r(2, 0.3)];
+    // Expert 2 was full when token 1 arrived; everything else computed.
+    let mask = [1, 0, 1, /* token 1 */ 0, 1, 0];
+    let kept = KeptMask {
+        mask: &mask,
+        num_experts: 3,
+    };
+    let recs = records_for_masked(&routes, 2, 0, 0, Some(kept)).unwrap();
+    let flags: Vec<u8> = recs.iter().map(|x| x.flags).collect();
+    assert_eq!(flags, [0, 0, 0, CAPACITY_DROP]);
+    assert_eq!(recs[3].gate, 0.3, "gate stays the router's");
+
+    let short = KeptMask {
+        mask: &mask[..5],
+        num_experts: 3,
+    };
+    assert!(matches!(
+        records_for_masked(&routes, 2, 0, 0, Some(short)),
+        Err(TelemetryError::KeptMaskShape {
+            expected: 6,
+            found: 5
+        })
+    ));
 }

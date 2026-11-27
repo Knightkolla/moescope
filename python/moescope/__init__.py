@@ -1,7 +1,7 @@
 """moescope: MoE routing telemetry.
 
 Route MoE tokens to experts and log every decision ``(token_id, layer_id,
-expert_id, gate)``. With the CUDA backend the log lives in GPU memory and is
+flags, expert_id, gate)``. With the CUDA backend the log lives in GPU memory and is
 written by the routing kernel itself, so nothing crosses PCIe until you call
 :func:`drain` once at the end.
 
@@ -26,6 +26,7 @@ from . import _native
 from ._native import Recorder, built_with_cuda, cuda_available
 
 __all__ = [
+    "CAPACITY_DROP",
     "RECORD_DTYPE",
     "Recorder",
     "advance_tokens",
@@ -42,9 +43,15 @@ __all__ = [
 
 #: One row per routing decision; byte-identical to the Rust/CUDA struct.
 RECORD_DTYPE = np.dtype(
-    [("token_id", "<u4"), ("layer_id", "<u2"), ("expert_id", "<u2"), ("gate", "<f4")]
+    [("token_id", "<u4"), ("layer_id", "u1"), ("flags", "u1"), ("expert_id", "<u2"), ("gate", "<f4")]
 )
 assert RECORD_DTYPE.itemsize == _native.RECORD_ITEMSIZE == 12
+
+#: ``flags`` bit: the router chose this expert, but the expert never computed
+#: the token because it was full (capacity-factor MoE such as Switch
+#: Transformer or NLLB-MoE). ``gate`` is still the router's gate. Set only
+#: when the model's dispatch mask is passed as ``kept`` (``attach`` does).
+CAPACITY_DROP = int(_native.CAPACITY_DROP)
 
 _default: Optional[Recorder] = None
 
@@ -123,6 +130,7 @@ def route_and_log(
     layer_id: int,
     token_offset: int = 0,
     recorder: Optional[Recorder] = None,
+    kept: Any = None,
 ) -> None:
     """Route one MoE layer's tokens and append each decision to the log.
 
@@ -132,8 +140,11 @@ def route_and_log(
         read in place on the current stream (zero-copy, no host sync, CUDA
         graph capturable); anything else is copied to host first.
     k: experts per token.
-    layer_id: tag stored in every record (0-65535).
+    layer_id: tag stored in every record (0-255).
     token_offset: added to the flattened token index to form ``token_id``.
+    kept: optional ``[..., num_experts]`` dispatch mask after capacity, same
+        leading shape as ``logits`` (nonzero = the expert computed the
+        token). Decisions it marks 0 get ``flags & CAPACITY_DROP``.
     """
     rec = _recorder(recorder)
     if _is_torch_tensor(logits):
@@ -146,17 +157,35 @@ def route_and_log(
             if dtype is None:
                 x, dtype = x.float(), "float32"
             x = x.contiguous()
+            m = None
+            if kept is not None:
+                m = _as_torch(kept, x.device).reshape(x.shape)
+                m = (m != 0).to(torch.uint8).contiguous()
             # Launch on the caller's current stream: ordered after the op that
             # produced the logits, no host sync, and capturable in a CUDA graph.
+            # (The temporaries above are freed in that stream's order too.)
             stream = torch.cuda.current_stream(x.device).cuda_stream
             rec.route_and_log_device(
-                x.data_ptr(), x.shape[0], x.shape[1], k, layer_id, token_offset, dtype=dtype, stream=stream
+                x.data_ptr(), x.shape[0], x.shape[1], k, layer_id, token_offset, dtype=dtype, stream=stream,
+                kept_ptr=0 if m is None else m.data_ptr(),
             )
             return
         logits = x.float().cpu().numpy()
     x = np.ascontiguousarray(logits, dtype=np.float32)
     x = x.reshape(-1, x.shape[-1])
-    rec.route_and_log(x, k, layer_id, token_offset)
+    m = None
+    if kept is not None:
+        if _is_torch_tensor(kept):
+            kept = kept.detach().cpu().numpy()
+        m = np.ascontiguousarray(np.asarray(kept).reshape(x.shape) != 0, dtype=np.uint8)
+    rec.route_and_log(x, k, layer_id, token_offset, kept=m)
+
+
+def _as_torch(t: Any, device):
+    import torch
+
+    t = t.detach() if _is_torch_tensor(t) else torch.as_tensor(np.asarray(t))
+    return t.to(device)
 
 
 def advance_tokens(n: int, recorder: Optional[Recorder] = None) -> None:

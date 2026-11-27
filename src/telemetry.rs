@@ -11,18 +11,34 @@ use std::fmt;
 use crate::router::Route;
 
 /// One routing decision: token `token_id` in MoE layer `layer_id` was sent to
-/// expert `expert_id` with gate weight `gate`.
+/// expert `expert_id` with gate weight `gate`. `flags` is a bit set, see
+/// [`CAPACITY_DROP`].
 ///
 /// `#[repr(C)]`, 12 bytes, no padding; identical to `TelemetryRecord` in the
 /// CUDA source and to the numpy dtype exposed to Python
-/// (`<u4 token_id, <u2 layer_id, <u2 expert_id, <f4 gate`).
+/// (`<u4 token_id, u1 layer_id, u1 flags, <u2 expert_id, <f4 gate`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TelemetryRecord {
     pub token_id: u32,
-    pub layer_id: u16,
+    pub layer_id: u8,
+    pub flags: u8,
     pub expert_id: u16,
     pub gate: f32,
+}
+
+/// `flags` bit: the router chose this expert but the expert never computed
+/// the token, because the expert was full (capacity-factor MoE, e.g.
+/// Switch Transformer). `gate` is still the router's gate. Set only when the
+/// caller passes the model's own dispatch mask ([`KeptMask`]).
+pub const CAPACITY_DROP: u8 = 1;
+
+/// What the experts actually received: `mask[t * num_experts + e] != 0` iff
+/// expert `e` computed token `t` (the model's dispatch mask after capacity).
+#[derive(Debug, Clone, Copy)]
+pub struct KeptMask<'a> {
+    pub mask: &'a [u8],
+    pub num_experts: usize,
 }
 
 const _: () = assert!(std::mem::size_of::<TelemetryRecord>() == 12);
@@ -49,6 +65,8 @@ pub enum TelemetryError {
         token_offset: u32,
         num_tokens: usize,
     },
+    /// A [`KeptMask`] must be `num_tokens * num_experts` bytes.
+    KeptMaskShape { expected: usize, found: usize },
 }
 
 impl fmt::Display for TelemetryError {
@@ -64,6 +82,12 @@ impl fmt::Display for TelemetryError {
                 write!(
                     f,
                     "token_offset {token_offset} + {num_tokens} tokens overflows u32"
+                )
+            }
+            TelemetryError::KeptMaskShape { expected, found } => {
+                write!(
+                    f,
+                    "kept mask has {found} entries, expected {expected} (tokens x experts)"
                 )
             }
         }
@@ -90,11 +114,33 @@ pub fn check_token_range(token_offset: u32, num_tokens: usize) -> Result<(), Tel
 pub fn records_for(
     routes: &[Route],
     k: usize,
-    layer_id: u16,
+    layer_id: u8,
     token_offset: u32,
 ) -> Result<Vec<TelemetryRecord>, TelemetryError> {
+    records_for_masked(routes, k, layer_id, token_offset, None)
+}
+
+/// [`records_for`], flagging [`CAPACITY_DROP`] on every decision the
+/// model's dispatch mask says was never computed.
+pub fn records_for_masked(
+    routes: &[Route],
+    k: usize,
+    layer_id: u8,
+    token_offset: u32,
+    kept: Option<KeptMask<'_>>,
+) -> Result<Vec<TelemetryRecord>, TelemetryError> {
     assert!(k > 0, "k must be >= 1");
-    check_token_range(token_offset, routes.len() / k)?;
+    let n = routes.len() / k;
+    check_token_range(token_offset, n)?;
+    if let Some(m) = kept {
+        let expected = n * m.num_experts;
+        if m.mask.len() != expected {
+            return Err(TelemetryError::KeptMaskShape {
+                expected,
+                found: m.mask.len(),
+            });
+        }
+    }
     routes
         .iter()
         .enumerate()
@@ -103,9 +149,16 @@ pub fn records_for(
                 u16::try_from(r.expert_id).map_err(|_| TelemetryError::ExpertIdOverflow {
                     expert_id: r.expert_id,
                 })?;
+            let t = a / k;
+            let dropped = kept.is_some_and(|m| {
+                m.mask
+                    .get(t * m.num_experts + r.expert_id as usize)
+                    .is_some_and(|&x| x == 0)
+            });
             Ok(TelemetryRecord {
-                token_id: token_offset + (a / k) as u32,
+                token_id: token_offset + t as u32,
                 layer_id,
+                flags: if dropped { CAPACITY_DROP } else { 0 },
                 expert_id,
                 gate: r.gate,
             })
@@ -156,10 +209,23 @@ impl HostTelemetry {
         &mut self,
         routes: &[Route],
         k: usize,
-        layer_id: u16,
+        layer_id: u8,
         token_offset: u32,
     ) -> Result<(), TelemetryError> {
-        let new = records_for(routes, k, layer_id, token_offset)?;
+        self.log_routes_masked(routes, k, layer_id, token_offset, None)
+    }
+
+    /// [`log_routes`](Self::log_routes) with the model's dispatch mask, so
+    /// decisions the experts never computed carry [`CAPACITY_DROP`].
+    pub fn log_routes_masked(
+        &mut self,
+        routes: &[Route],
+        k: usize,
+        layer_id: u8,
+        token_offset: u32,
+        kept: Option<KeptMask<'_>>,
+    ) -> Result<(), TelemetryError> {
+        let new = records_for_masked(routes, k, layer_id, token_offset, kept)?;
         let room = self.capacity - self.records.len();
         let kept = new.len().min(room);
         self.dropped += (new.len() - kept) as u64;

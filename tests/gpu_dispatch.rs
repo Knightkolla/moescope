@@ -58,7 +58,7 @@ fn routes_dispatch_and_histogram_match_cpu() {
 #[test]
 fn telemetry_accumulates_across_layers_and_drains_once() {
     let Some(router) = gpu() else { return };
-    let (n, e, k, layers) = (777, 32, 4, 3u16);
+    let (n, e, k, layers) = (777, 32, 4, 3u8);
     let mut gpu_log = TelemetryBuffer::new(router, n * k * layers as usize).unwrap();
     let mut cpu_log = HostTelemetry::new(n * k * layers as usize);
     for layer in 0..layers {
