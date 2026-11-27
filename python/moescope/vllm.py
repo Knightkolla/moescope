@@ -201,17 +201,18 @@ class VllmSession:
 
         return [r for r in self.llm.apply_model(partial(fn, self.key)) if r is not None]
 
-    def drain_with_stats(self):
+    def drain_with_stats(self, sort: bool = False):
         """``(records, dropped)``; resets the worker's log."""
-        from . import RECORD_DTYPE
+        from . import RECORD_DTYPE, sort_records
 
         out = self._call(_worker_drain)
         if not out:
             return np.zeros(0, RECORD_DTYPE), 0
-        return out[0]
+        log, dropped = out[0]
+        return (sort_records(log) if sort else log), dropped
 
-    def drain(self) -> np.ndarray:
-        log, dropped = self.drain_with_stats()
+    def drain(self, sort: bool = False) -> np.ndarray:
+        log, dropped = self.drain_with_stats(sort=sort)
         if dropped:
             import warnings
 

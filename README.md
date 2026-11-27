@@ -302,6 +302,7 @@ Each token is handled by a group of 2–32 threads, sized to the expert count. T
 
 - **Ties and NaN:** the higher logit wins. On an exact tie the lower expert index wins. NaN ranks below every number.
 - **Appending:** each token reserves its k log slots with one 64-bit `atomicAdd`. Records past capacity are counted as `dropped`, not written.
+- **Order:** a token's k records are contiguous and in rank order (best expert first), but the order of tokens follows which thread group won the atomic, so it changes between runs. `drain(sort=True)` (or `moescope.sort_records`) gives a canonical layer → token → rank order, identical byte for byte across runs on the same inputs. The analysis helpers don't depend on order.
 - **Foreign pointers:** a torch tensor's address is checked with `cuMemGetAddressRange` and its device ordinal is verified before the kernel reads it. The check works per driver allocation: torch pools tensors, so a wrong length could read a neighbouring tensor, but never unmapped memory.
 - **Record:** 12 bytes, `token_id u32, layer_id u8, flags u8, expert_id u16, gate f32` (0.3 split the old u16 `layer_id` into `layer_id` + `flags`).
 - **Limits:** `k ≤ 32`, `num_experts ≤ 65,536`, layer ids ≤ 255, and every flat index must fit in u32.

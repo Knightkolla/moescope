@@ -59,6 +59,27 @@ def test_kept_mask_on_device_sets_capacity_drop(mask_dtype):
     assert len(log) == n * K and np.array_equal(got, want) and want.any()
 
 
+def test_sorted_drain_is_identical_across_runs():
+    """Append order on the GPU depends on which thread group wins the atomic;
+    sort=True must give the same bytes every run, with each token's k
+    records in rank order (best first)."""
+    n = 50_000
+    x = torch.randn(n, E, device="cuda")
+    runs = []
+    for _ in range(3):
+        rec = moescope.Recorder(capacity=2 * n * K, mode="softmax_topk", device="cuda")
+        for layer in (1, 0):
+            moescope.route_and_log(x, k=K, layer_id=layer, recorder=rec)
+        runs.append(moescope.drain(rec, sort=True))
+    assert all(r.tobytes() == runs[0].tobytes() for r in runs[1:])
+    log = runs[0]
+    assert (np.diff(log["layer_id"].astype(np.int64)) >= 0).all()
+    g = log["gate"].reshape(-1, K)
+    assert (np.diff(g, axis=1) <= 0).all(), "within a token, best expert first"
+    t = log["token_id"].reshape(-1, K)
+    assert (t == t[:, :1]).all() and np.array_equal(t[: n, 0], np.arange(n))
+
+
 def test_logits_from_a_non_blocking_stream_need_no_sync():
     n = 8192
     rec = moescope.Recorder(capacity=n * K, mode="softmax_topk", device="cuda")

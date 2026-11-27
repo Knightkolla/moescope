@@ -38,6 +38,7 @@ __all__ = [
     "drain_with_stats",
     "route_and_log",
     "routing_spec",
+    "sort_records",
     "set_bias",
 ]
 
@@ -201,20 +202,32 @@ def advance_tokens(n: int, recorder: Optional[Recorder] = None) -> None:
     rec.advance_tokens(n, stream=torch.cuda.current_stream().cuda_stream)
 
 
-def drain_with_stats(recorder: Optional[Recorder] = None) -> Tuple[np.ndarray, int]:
+def sort_records(records: np.ndarray) -> np.ndarray:
+    """Canonical order: by ``layer_id``, then ``token_id``; within a token,
+    the router's rank order (best expert first) is kept, since the sort is
+    stable and each token's k records are written contiguously in rank
+    order. Two runs over the same inputs then compare row by row."""
+    return records[np.lexsort((records["token_id"], records["layer_id"]))]
+
+
+def drain_with_stats(recorder: Optional[Recorder] = None, sort: bool = False) -> Tuple[np.ndarray, int]:
     """Copy the whole log to host (one transfer) and reset it.
 
-    Returns ``(records, dropped)``. On the GPU, record order is the order
-    threads appended them, not token order; sort if you need one.
+    Returns ``(records, dropped)``. On the GPU the k records of one token
+    are contiguous and in rank order, but the order of tokens is the order
+    their thread groups won the append atomic, so it changes from run to
+    run. ``sort=True`` returns :func:`sort_records` order instead (costs a
+    host sort, a few seconds for ~50M records).
     """
     raw, dropped = _recorder(recorder).drain()
-    return np.frombuffer(raw, dtype=RECORD_DTYPE).copy(), int(dropped)
+    records = np.frombuffer(raw, dtype=RECORD_DTYPE).copy()
+    return (sort_records(records) if sort else records), int(dropped)
 
 
-def drain(recorder: Optional[Recorder] = None) -> np.ndarray:
+def drain(recorder: Optional[Recorder] = None, sort: bool = False) -> np.ndarray:
     """Like :func:`drain_with_stats` but returns only the records, warning
     if any were dropped because the buffer was full."""
-    records, dropped = drain_with_stats(recorder)
+    records, dropped = drain_with_stats(recorder, sort=sort)
     if dropped:
         warnings.warn(
             f"moescope: {dropped} routing records dropped (capacity full); "

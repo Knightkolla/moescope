@@ -241,17 +241,18 @@ class Session:
             recorder.set_device_token_ids(True)
         self.detach()
 
-    def drain_with_stats(self):
+    def drain_with_stats(self, sort: bool = False):
         """``(records, dropped)``, like :func:`moescope.drain_with_stats`."""
         from . import drain_with_stats
 
-        return drain_with_stats(self.recorder)
+        return drain_with_stats(self.recorder, sort=sort)
 
-    def drain(self) -> np.ndarray:
-        """All records logged so far (and resets the log)."""
+    def drain(self, sort: bool = False) -> np.ndarray:
+        """All records logged so far (and resets the log). ``sort=True``:
+        layer, then token, then rank order (see :func:`moescope.sort_records`)."""
         from . import drain
 
-        return drain(self.recorder)
+        return drain(self.recorder, sort=sort)
 
     def parity(self, log: np.ndarray) -> Optional[Dict[str, Any]]:
         """Checks ``log`` against what the model's *experts* computed (needs

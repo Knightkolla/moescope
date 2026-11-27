@@ -141,3 +141,14 @@ def test_kept_mask_flags_capacity_drops_on_cpu():
     assert np.array_equal((log["flags"] & moescope.CAPACITY_DROP) != 0, want) and want.any()
     with pytest.raises(ValueError):
         moescope.route_and_log(x, k=4, layer_id=3, recorder=rec, kept=kept[:10].ravel())
+
+
+def test_sort_records_keeps_rank_order_within_a_token():
+    log = np.zeros(6, moescope.RECORD_DTYPE)
+    log["layer_id"] = [1, 1, 0, 0, 0, 0]
+    log["token_id"] = [0, 0, 1, 1, 0, 0]
+    log["expert_id"] = [9, 2, 7, 3, 5, 1]  # each token: best expert first
+    out = moescope.sort_records(log)
+    assert out["layer_id"].tolist() == [0, 0, 0, 0, 1, 1]
+    assert out["token_id"].tolist() == [0, 0, 1, 1, 0, 0]
+    assert out["expert_id"].tolist() == [5, 1, 7, 3, 9, 2]
