@@ -276,7 +276,7 @@ def main():
             "prefill_vs_generated_js_per_layer": [js_bits(all_usage[l], gen_all[l]) for l in range(L)],
         }
         save()
-    print(json.dumps({k: v for k, v in result.items() if "per_layer" not in k}, indent=1))
+    print(json.dumps({k: v for k, v in result.items() if "per_layer" not in k and "per_domain" not in k}, indent=1))
 
 
 def plot(r, domains, path):

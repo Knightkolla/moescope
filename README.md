@@ -68,7 +68,7 @@ The same pattern shows up in the first three: in the most specialised layer, **c
 
 > Each run uses ~8k tokens of hand-written text. The numbers show what the log can reveal; they are not a study of these models (see [Routing at scale](#routing-at-scale)). Granite-1B ran on Colab; the others on Kaggle (transformers 5.20).
 >
-> ¹ Measured with the earlier one-thread-per-token kernel. ² fp16 model split over two T4s; each layer's logits are copied to the logging GPU first.
+> ¹ Measured with the earlier one-thread-per-token kernel. ² fp16 model split over two T4s; the logits of layers on the second GPU are copied to the logging GPU first. Since 0.3 that copy has no host sync, which measured the same (+3.4% in a later run): with ~240-token batches this forward is launch-bound, so the per-layer hook cost is the likely source (not profiled).
 
 ## Routing at scale
 
@@ -83,6 +83,45 @@ The results above come from ~8k tokens. `examples/corpus_study.py` repeats the a
 5. **Routing drifts during generation, more in deeper layers.** Over 512 greedily generated tokens (8 prompts), the JS divergence between the first and last quarter grows from 0.01 bits in layer 0 to 0.06–0.09 bits in layers 8–15.
 
 > One model, four domains, greedy decoding: a measurement, not a general claim about MoE models. The raw numbers are in [`docs/olmoe_study.json`](docs/olmoe_study.json).
+
+### Same study, DeepSeek-style routing: LFM2-8B-A1B
+
+LFM2-8B-A1B routes like DeepSeek-V3 (sigmoid scores, a per-expert selection bias, renormalized top-k): 22 MoE layers × 32 experts, top-4. Same corpora, **35.0M decisions** over 397k tokens, 0 dropped, model split over two T4s.
+
+| | OLMoE-1B-7B (softmax) | LFM2-8B-A1B (sigmoid + bias) |
+|---|---:|---:|
+| Pair sharing the most top-8 experts | code–maths **0.37** (0.35–0.38) | English–French **0.48** (0.46–0.51) |
+| code–maths overlap | 0.37 | 0.29 (0.27–0.30) |
+| Other pairs | 0.05–0.22 | 0.16–0.26 |
+| Overlap of two random top-8 sets | 0.07 | 0.14 |
+| Busiest expert vs fair share | 3.55× (3.51–3.59) | **2.88×** (2.86–2.89), 1.5–6.4× per layer |
+| Near-idle experts (<10% of fair share) | 2 of 1,024 | 6 of 704 |
+| Position effect (JS, early vs late positions) | ≤ 0.035 bits | ≤ 0.06 bits |
+| Generation drift (JS, first vs last quarter) | 0.01 → 0.06–0.09 bits, grows with depth | 0.016–0.084 bits, mean 0.039, no depth trend |
+
+The bias-balanced router spreads load more evenly on average (2.9× vs 3.6×), but not uniformly: one layer still sends 6.4× the fair share to its busiest expert. Where OLMoE groups code with maths, LFM2 groups the two natural languages. Overlap numbers are not directly comparable across the two models (8 of 32 experts is a quarter of a layer, 8 of 64 an eighth), hence the random baselines.
+
+## Which experts does a workload need?
+
+`examples/expert_budget.py` turns a routing log into a pruning or offload plan and then measures what it costs. On OLMoE-1B-7B it logs ~80k tokens of code, keeps per layer the experts that carry 90 / 95 / 99 / 99.9% of the code routing's gate mass, and measures perplexity on **held-out** code while the router may only pick kept experts (it falls back to its next-best allowed expert). Controls: the same number of experts per layer chosen from a French log, and chosen at random.
+
+| experts kept per layer | chosen from the code log | from a French log | random |
+|---:|---:|---:|---:|
+| 64 (full model) | ppl 3.644 | | |
+| 59.9 | **+0.2%** | +13.7% | +22.1% |
+| 51.4 | **+0.2%** | +43.0% | +104% |
+| 36.8 | **+1.3%** | +680% | +523% |
+| 27.8 | **+2.4%** | +2,551% | +9,549% |
+
+Keeping **43% of the experts** costs code **2.4%** perplexity when they are chosen from the code log, and destroys the model when they are not. For CPU offload, the same log says how much routing a GPU-resident set serves on held-out code:
+
+| experts on GPU per layer | 8 | 16 | 24 | 32 | 48 |
+|---|---:|---:|---:|---:|---:|
+| busiest on the code log | 54% | **74%** | 85% | **92%** | 98% |
+| busiest on a French log | 14% | 26% | 37% | 50% | 75% |
+| (no plan: uniform) | 13% | 25% | 38% | 50% | 75% |
+
+> One model, one target domain, held-out text from the same code datasets (MBPP / HumanEval): in-distribution, not a claim about general code. Perplexity is not task accuracy. The helpers are in `moescope.analysis` (`expert_usage`, `experts_for_coverage`, `resident_hit_rate`, `budget_curve`).
 
 ## Quick start
 
